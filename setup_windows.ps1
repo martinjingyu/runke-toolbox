@@ -1,4 +1,4 @@
-﻿# 全新 Windows 电脑上的一键环境搭建：找不到 Python 就自动下载安装（装给当前用户，不需要管理员权限），
+﻿﻿# 全新 Windows 电脑上的一键环境搭建：找不到 Python 就自动下载安装（装给当前用户，不需要管理员权限），
 # 建一个项目专属的虚拟环境（.venv），装好依赖，然后启动软件。
 #
 # 用法：双击 setup_windows.bat（它会调用这个脚本）。
@@ -35,6 +35,17 @@ function Get-PythonExe {
             }
         } catch {}
     }
+
+    # 上面全靠 PATH 找命令——但改了注册表里的 PATH 之后，已经在运行的 explorer.exe 不一定会
+    # 马上感知到，双击这个脚本重新弹出来的窗口，环境变量可能还是旧的，要等重新登录/重启资源
+    # 管理器才会刷新。不能让这种情况被误判成"没装 Python"又重新下载一遍，所以就算上面的 PATH
+    # 检测失败，也直接去 python.org per-user 安装的固定位置探一下，装过的话大概率就在这。
+    $pythonRoot = Join-Path $env:LOCALAPPDATA "Programs\Python"
+    $candidate = Get-ChildItem -Path $pythonRoot -Filter "python.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($candidate) {
+        return $candidate.FullName
+    }
+
     return $null
 }
 
