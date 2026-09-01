@@ -177,12 +177,15 @@ if (-not (Test-Path $VenvPython)) {
 
 Write-Host ""
 Write-Host "== 第 3 步：安装依赖包 =="
+# 升级 pip 这一步是锦上添花，不是必须的——Python 3.11.9 自带的 pip 已经完全够用（装
+# PySide6/PyYAML 这种纯 wheel 包不需要多新的 pip），失败了没必要卡住整个安装，提醒一下、
+# 继续往下走就行。
 $exitCode = Invoke-ExternalCommand -Exe $VenvPython -CmdArgs @("-m", "pip", "install", "--upgrade", "pip")
 if ($exitCode -ne 0) {
     Write-Host ""
-    Write-Host "升级 pip 失败了（退出码 $exitCode，完整报错见上面），停在这一步，不往下走了。"
-    exit 1
+    Write-Host "升级 pip 没成功（退出码 $exitCode），不影响继续安装，跳过这一步。"
 }
+
 $exitCode = Invoke-ExternalCommand -Exe $VenvPython -CmdArgs @("-m", "pip", "install", "-r", (Join-Path $ProjectRoot "requirements.txt"))
 if ($exitCode -ne 0) {
     Write-Host ""
