@@ -1,8 +1,14 @@
-﻿﻿# 全新 Windows 电脑上的一键环境搭建：找不到 Python 就自动下载安装（装给当前用户，不需要管理员权限），
+﻿
+# 全新 Windows 电脑上的一键环境搭建：找不到 Python 就自动下载安装（装给当前用户，不需要管理员权限），
 # 建一个项目专属的虚拟环境（.venv），装好依赖，然后启动软件。
 #
 # 用法：双击 setup_windows.bat（它会调用这个脚本）。
 # 以后不用再装环境了，双击 run_windows.bat 直接启动就行。
+#
+# 上面故意留了一个空行——文件是 UTF-8 BOM 编码（中文注释要靠这个 Windows PowerShell 5.1
+# 才能正确显示，不然会乱码甚至解析出错），但实测在某些机器上，如果 BOM 后面紧跟着的第一个
+# 字符就是"#"，PowerShell 会把 BOM 和"#"粘在一起识别成一个命令名去执行，报"无法将"#"项识别
+# 为 cmdlet"，脚本第一行就直接跑不起来。中间空一行能避开这个问题。
 
 $ErrorActionPreference = "Stop"
 
@@ -19,6 +25,21 @@ $PythonVersion = "3.11.9"
 $PythonInstallerUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-amd64.exe"
 $VenvDir = Join-Path $ProjectRoot ".venv"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
+
+function Test-PythonWorks {
+    # 光看 python.exe 这个文件存不存在不够——测试装/卸载装环境的时候，很容易在目录里留下
+    # 卸载不干净的残留（比如 python.exe 还在，但旁边的 DLL/标准库已经被删了一部分），这种
+    # "看着装了、其实跑不起来"的情况必须真的跑一下才能发现，不然后面 venv/pip 会莫名其妙
+    # 失败，还不容易看出来是这个原因。
+    param([string]$PythonExe)
+    if (-not (Test-Path $PythonExe)) { return $false }
+    try {
+        $out = & $PythonExe -c "print('ok')" 2>$null
+        return ($LASTEXITCODE -eq 0 -and $out -eq "ok")
+    } catch {
+        return $false
+    }
+}
 
 function Get-PythonExe {
     # 依次试 py launcher 和 python 命令，返回一个真的能跑起来的 python.exe 完整路径；
@@ -41,9 +62,11 @@ function Get-PythonExe {
     # 管理器才会刷新。不能让这种情况被误判成"没装 Python"又重新下载一遍，所以就算上面的 PATH
     # 检测失败，也直接去 python.org per-user 安装的固定位置探一下，装过的话大概率就在这。
     $pythonRoot = Join-Path $env:LOCALAPPDATA "Programs\Python"
-    $candidate = Get-ChildItem -Path $pythonRoot -Filter "python.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($candidate) {
-        return $candidate.FullName
+    $candidates = Get-ChildItem -Path $pythonRoot -Filter "python.exe" -Recurse -ErrorAction SilentlyContinue
+    foreach ($c in $candidates) {
+        if (Test-PythonWorks -PythonExe $c.FullName) {
+            return $c.FullName
+        }
     }
 
     return $null
@@ -118,6 +141,16 @@ Write-Host ""
 Write-Host "== 第 2 步：建虚拟环境（.venv）=="
 if (-not (Test-Path $VenvPython)) {
     & $systemPython -m venv $VenvDir
+    # & 调用外部程序失败，PowerShell 不会自己停下来（$ErrorActionPreference = "Stop" 只管
+    # PowerShell 自己的报错，不管外部程序的退出码），得手动检查，不然会像之前那样一路空跑到
+    # 最后启动软件的时候才炸出一个不知所云的"No pyvenv.cfg file"，看不出问题出在哪一步。
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $VenvDir "pyvenv.cfg"))) {
+        Write-Host ""
+        Write-Host "建虚拟环境失败了。如果最近用 uninstall_windows.bat 卸载/重装过 Python，"
+        Write-Host "可能是卸载没干净、留了点残留文件——建议再运行一次 uninstall_windows.bat 彻底清理，"
+        Write-Host "然后重新打开一个窗口再运行这个脚本。"
+        exit 1
+    }
 } else {
     Write-Host ".venv 已经存在，跳过"
 }
@@ -125,7 +158,17 @@ if (-not (Test-Path $VenvPython)) {
 Write-Host ""
 Write-Host "== 第 3 步：安装依赖包 =="
 & $VenvPython -m pip install --upgrade pip
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "升级 pip 失败了（退出码 $LASTEXITCODE），停在这一步，不往下走了。"
+    exit 1
+}
 & $VenvPython -m pip install -r (Join-Path $ProjectRoot "requirements.txt")
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "安装依赖包失败了（退出码 $LASTEXITCODE），停在这一步，不往下走了。"
+    exit 1
+}
 
 Write-Host ""
 Write-Host "== 环境搭建完成，启动程序 =="

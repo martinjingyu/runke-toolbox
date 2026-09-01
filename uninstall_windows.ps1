@@ -1,5 +1,10 @@
-﻿# 把 setup_windows.ps1（以及软件运行时按需装的 Tesseract）装的东西清掉，方便重新测试
+﻿
+# 把 setup_windows.ps1（以及软件运行时按需装的 Tesseract）装的东西清掉，方便重新测试
 # "全新 Windows 电脑"那一套安装流程，不用真的找一台新电脑。
+#
+# 上面故意留了一个空行，是为了绕开一个实测踩过的坑：文件是 UTF-8 BOM 编码，但如果 BOM 后面
+# 紧跟着的第一个字符就是"#"，某些 PowerShell 环境会把 BOM 和"#"粘在一起识别成一个命令名去
+# 执行，报"无法将"#"项识别为 cmdlet"，脚本第一行就直接跑不起来。中间空一行能避开这个问题。
 #
 # 用法：双击 uninstall_windows.bat。
 #
@@ -74,6 +79,19 @@ Write-Host "== 第 2 步：卸载 Python =="
 # Python 的卸载可能会跳出系统自己的确认/进度窗口，跳出来正常点掉就行
 if (-not (Uninstall-ByDisplayNamePattern -Pattern "Python 3.1*")) {
     Write-Host "没找到本机装过 Python（或者不是 setup_windows.ps1 那种 per-user 安装方式），跳过"
+}
+
+# 走注册表卸载有时候会留一点残留文件（没删干净的目录、半个 python.exe 之类）——之前真的
+# 因为这个踩过坑：残留的 python.exe 还在，但装不全，建 venv/装依赖的时候会莫名其妙失败，
+# 还不容易看出来是这个原因。这里再检查一遍，卸载完目录还在的话直接强制删掉。
+$pythonRoot = Join-Path $env:LOCALAPPDATA "Programs\Python"
+if (Test-Path $pythonRoot) {
+    try {
+        Remove-Item -Recurse -Force $pythonRoot
+        Write-Host "清掉了卸载后剩下的残留目录：$pythonRoot"
+    } catch {
+        Write-Host "清理残留目录出错：$($_.Exception.Message)"
+    }
 }
 
 Write-Host ""
