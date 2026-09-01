@@ -1,0 +1,8 @@
+PySide6
+openpyxl
+pymupdf
+PyYAML
+pytest
+Pillow
+pylibdmtx
+pytesseract

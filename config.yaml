@@ -1,0 +1,7 @@
+# 全局配置。机器专属的覆盖项写到 config.local.yaml（不提交到 git）。
+
+storage:
+  # 目前只实现了 local；nas 接口已预留在 core/storage/nas.py，后续对接 NAS 时再实现。
+  backend: local
+  # local 后端的根目录，模块读写文件都相对这个目录
+  local_root: data
