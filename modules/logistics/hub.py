@@ -21,6 +21,12 @@ def _build_walmart_reconcile_panel() -> QWidget:
     return WalmartReconcilePanel()
 
 
+def _build_fba_label_redact_panel() -> QWidget:
+    from .fba_label_redact.panel import FbaLabelRedactPanel
+
+    return FbaLabelRedactPanel()
+
+
 def build_panel() -> QWidget:
     tools = [
         ToolInfo(
@@ -35,6 +41,15 @@ def build_panel() -> QWidget:
                 pip_package("pylibdmtx", display_name="pylibdmtx（解析箱唛条码）"),
                 pip_package("pytesseract", display_name="pytesseract（OCR 接口）"),
                 tesseract_ocr(),
+            ],
+        ),
+        ToolInfo(
+            id="fba_label_redact",
+            name="FBA 标签发货人信息脱敏",
+            description="批量去掉一个目录下箱唛 PDF 的发货人信息，加拿大目的地额外整个删掉发货地",
+            build_panel=_build_fba_label_redact_panel,
+            dependencies=[
+                pip_package("pymupdf", import_name="fitz", display_name="PyMuPDF（读取/编辑 PDF）"),
             ],
         ),
     ]
