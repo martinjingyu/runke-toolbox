@@ -72,6 +72,29 @@ function Get-PythonExe {
     return $null
 }
 
+function Invoke-ExternalCommand {
+    # 跑 venv / pip 这些外部命令，同时把完整输出录下来再打印——不能指望它们的输出会正常显示：
+    # 在 $ErrorActionPreference = "Stop" 底下，外部程序往 stderr 写一行东西，PowerShell 有时候
+    # 会当成"终止性错误"直接把命令打断、甚至把真正的报错内容盖住看不清楚。这里显式地把
+    # $ErrorActionPreference 临时放宽、完整收集输出，失败的时候原样打印出来，保证报错看得全。
+    param([string]$Exe, [string[]]$CmdArgs)
+
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & $Exe @CmdArgs 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+
+    foreach ($line in $output) {
+        Write-Host $line
+    }
+
+    return $exitCode
+}
+
 function Add-ToUserPath {
     # 把目录持久化地加进"当前用户"的 PATH（写注册表，不是只改当前进程），这样以后新开的
     # 命令行窗口、双击 run_windows.bat 都能直接找到 python，不用每次都靠这个脚本兜底。
@@ -140,15 +163,12 @@ if ($null -eq $systemPython) {
 Write-Host ""
 Write-Host "== 第 2 步：建虚拟环境（.venv）=="
 if (-not (Test-Path $VenvPython)) {
-    & $systemPython -m venv $VenvDir
-    # & 调用外部程序失败，PowerShell 不会自己停下来（$ErrorActionPreference = "Stop" 只管
-    # PowerShell 自己的报错，不管外部程序的退出码），得手动检查，不然会像之前那样一路空跑到
-    # 最后启动软件的时候才炸出一个不知所云的"No pyvenv.cfg file"，看不出问题出在哪一步。
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $VenvDir "pyvenv.cfg"))) {
+    $exitCode = Invoke-ExternalCommand -Exe $systemPython -CmdArgs @("-m", "venv", $VenvDir)
+    if ($exitCode -ne 0 -or -not (Test-Path (Join-Path $VenvDir "pyvenv.cfg"))) {
         Write-Host ""
-        Write-Host "建虚拟环境失败了。如果最近用 uninstall_windows.bat 卸载/重装过 Python，"
-        Write-Host "可能是卸载没干净、留了点残留文件——建议再运行一次 uninstall_windows.bat 彻底清理，"
-        Write-Host "然后重新打开一个窗口再运行这个脚本。"
+        Write-Host "建虚拟环境失败了（完整报错见上面）。如果最近用 uninstall_windows.bat 卸载/重装过"
+        Write-Host "Python，可能是卸载没干净、留了点残留文件——建议再运行一次 uninstall_windows.bat"
+        Write-Host "彻底清理，然后重新打开一个窗口再运行这个脚本。"
         exit 1
     }
 } else {
@@ -157,16 +177,16 @@ if (-not (Test-Path $VenvPython)) {
 
 Write-Host ""
 Write-Host "== 第 3 步：安装依赖包 =="
-& $VenvPython -m pip install --upgrade pip
-if ($LASTEXITCODE -ne 0) {
+$exitCode = Invoke-ExternalCommand -Exe $VenvPython -CmdArgs @("-m", "pip", "install", "--upgrade", "pip")
+if ($exitCode -ne 0) {
     Write-Host ""
-    Write-Host "升级 pip 失败了（退出码 $LASTEXITCODE），停在这一步，不往下走了。"
+    Write-Host "升级 pip 失败了（退出码 $exitCode，完整报错见上面），停在这一步，不往下走了。"
     exit 1
 }
-& $VenvPython -m pip install -r (Join-Path $ProjectRoot "requirements.txt")
-if ($LASTEXITCODE -ne 0) {
+$exitCode = Invoke-ExternalCommand -Exe $VenvPython -CmdArgs @("-m", "pip", "install", "-r", (Join-Path $ProjectRoot "requirements.txt"))
+if ($exitCode -ne 0) {
     Write-Host ""
-    Write-Host "安装依赖包失败了（退出码 $LASTEXITCODE），停在这一步，不往下走了。"
+    Write-Host "安装依赖包失败了（退出码 $exitCode，完整报错见上面），停在这一步，不往下走了。"
     exit 1
 }
 
