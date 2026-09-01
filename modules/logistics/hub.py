@@ -1,0 +1,41 @@
+"""物流仓库部门的入口——列出这个部门有哪些工具，点了哪个才进那个工具的界面。
+
+这个文件本身只 import PySide6 和 core 里的通用组件，不 import 具体工具用到的 openpyxl/
+pymupdf/pylibdmtx/pytesseract 这些——那些是"发货数量核对"这一个工具自己的事，只有真的点开
+它才会被检查/安装/import（见 core/hub_widget.py 和 walmart_shipment_reconcile/panel.py）。
+以后物流仓库加新工具，在下面的列表里加一个 ToolInfo 就行。
+"""
+from __future__ import annotations
+
+from PySide6.QtWidgets import QWidget
+
+from core.dependency import pip_package
+from core.hub_widget import HubWidget, ToolInfo
+
+from .walmart_shipment_reconcile.tesseract_dependency import tesseract_ocr
+
+
+def _build_walmart_reconcile_panel() -> QWidget:
+    from .walmart_shipment_reconcile.panel import WalmartReconcilePanel
+
+    return WalmartReconcilePanel()
+
+
+def build_panel() -> QWidget:
+    tools = [
+        ToolInfo(
+            id="walmart_shipment_reconcile",
+            name="发货数量核对（Walmart）",
+            description="核对箱唛实际发货数量和发货计划表是否一致，并按 SKU 拆分箱唛 PDF",
+            build_panel=_build_walmart_reconcile_panel,
+            dependencies=[
+                pip_package("openpyxl", display_name="openpyxl（读写 Excel）"),
+                pip_package("pymupdf", import_name="fitz", display_name="PyMuPDF（读取 PDF）"),
+                pip_package("Pillow", import_name="PIL", display_name="Pillow（图片处理）"),
+                pip_package("pylibdmtx", display_name="pylibdmtx（解析箱唛条码）"),
+                pip_package("pytesseract", display_name="pytesseract（OCR 接口）"),
+                tesseract_ocr(),
+            ],
+        ),
+    ]
+    return HubWidget(tools)

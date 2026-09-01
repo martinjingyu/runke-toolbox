@@ -1,10 +1,11 @@
 """物流仓库模块。
 
-目前有一个功能：发货数量核对（Walmart），见 walmart_shipment_reconcile/ 和 panel.py。
+目前有一个功能：发货数量核对（Walmart），见 hub.py（部门入口，轻量）和
+walmart_shipment_reconcile/panel.py（工具自己的界面，点开才会被 import）。
 其他功能要等对应的《需求申请表》/《开发确认回执单》确认完再加，见
 /Users/jingyuhuang/Documents/Work/闰科/软件开发SOP。
 """
-from .panel import build_panel
+from .hub import build_panel
 
 MODULE_INFO = {
     "id": "logistics",

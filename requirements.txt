@@ -1,8 +1,5 @@
+# 核心壳的基础依赖——setup_windows.ps1 装的就是这些，跟具体哪个部门用哪个工具无关。
+# 各工具自己的依赖（比如"发货数量核对"要用到 openpyxl/pymupdf/pylibdmtx/pytesseract）
+# 不在这里，那些是点开对应工具时才检查/安装的，见 modules/logistics/hub.py。
 PySide6
-openpyxl
-pymupdf
 PyYAML
-pytest
-Pillow
-pylibdmtx
-pytesseract

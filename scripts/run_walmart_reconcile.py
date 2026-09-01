@@ -1,7 +1,11 @@
-"""命令行跑一次"Walmart 发货数量核对"，还没接进主界面前先用这个。
+"""命令行跑一次"Walmart 发货数量核对"，方便批处理/调试用（图形界面里也能跑这个工具）。
 
 用法：
     python scripts/run_walmart_reconcile.py 翻译表.xlsx 发货计划表.xlsx 箱唛1.pdf 箱唛2.pdf ... --out 输出目录
+
+注意：这个工具自己的依赖（openpyxl/pymupdf/pylibdmtx/pytesseract + Tesseract）不在项目的
+基础 requirements.txt 里——图形界面走的是"点开这个工具才检查/安装"，命令行这条路没有界面
+弹窗提示，所以依赖没装齐的话会直接从 run() 里报错，需要自己先装好（见 SETUP.md）。
 """
 from __future__ import annotations
 
@@ -11,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from modules.logistics.walmart_shipment_reconcile import run, write_report_xlsx
+from modules.logistics.walmart_shipment_reconcile.reconcile import run, write_report_xlsx
 
 
 def main():

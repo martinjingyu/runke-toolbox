@@ -1,10 +1,15 @@
-"""物流仓库模块的界面——目前只有一个功能：发货数量核对（Walmart）。
+"""发货数量核对（Walmart）这个工具自己的界面。
 
 核对本身要跑几分钟（条码解码是主要耗时），放在后台线程里跑，不然界面会卡死；
 线程跑完用信号把结果／错误传回主线程再更新界面，不能在后台线程里直接碰 Qt 控件。
+
+这个模块只在用户真的点开这个工具时才会被 import（见 ../hub.py），import 的时候会带出
+fitz/pylibdmtx/pytesseract 这些依赖——所以点开之前 core/hub_widget.py 会先检查这些装了没有，
+没装会先提示安装，装完才会真的走到这个文件被 import 的那一步。
 """
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from PySide6.QtCore import QThread, QUrl, Signal
@@ -25,9 +30,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .walmart_shipment_reconcile import RunReport
-from .walmart_shipment_reconcile import run as run_reconcile
-from .walmart_shipment_reconcile import write_report_xlsx
+from .reconcile import RunReport
+from .reconcile import run as run_reconcile
+from .reconcile import write_report_xlsx
 
 _MATCH_COLOR = QColor("#C6E0B4")
 _MISMATCH_COLOR = QColor("#F8CBAD")
@@ -44,6 +49,12 @@ class _ReconcileWorker(QThread):
         self._translation_path = translation_path
         self._plan_path = plan_path
         self._output_dir = output_dir
+        self._cancel_event = threading.Event()
+
+    def cancel(self):
+        # 只是发个信号让 run_reconcile 自己在合适的时机停下来、把子进程杀掉——不能用
+        # QThread.terminate()，实测线程卡在 concurrent.futures 的等待里时那个会直接卡死。
+        self._cancel_event.set()
 
     def run(self):
         try:
@@ -53,10 +64,14 @@ class _ReconcileWorker(QThread):
                 self._plan_path,
                 self._output_dir,
                 progress_callback=lambda done, total: self.progress.emit(done, total),
+                cancel_event=self._cancel_event,
             )
+            if report.cancelled:
+                return
             write_report_xlsx(report, Path(self._output_dir) / "核对结果.xlsx")
         except Exception as exc:  # 任何失败原因都要带回界面告诉用户，不能让线程默默死掉
-            self.failed.emit(str(exc))
+            if not self._cancel_event.is_set():
+                self.failed.emit(str(exc))
             return
         self.succeeded.emit(report)
 
@@ -241,18 +256,12 @@ class WalmartReconcilePanel(QWidget):
         if output_dir:
             QDesktopServices.openUrl(QUrl.fromLocalFile(output_dir))
 
-
-def build_panel() -> QWidget:
-    """物流仓库这个部门的入口——先看到工具列表，点进去才是具体某个工具的界面。
-    以后物流仓库加新工具，在这个列表里加一项 ToolInfo 就行，不用改 HubWidget。"""
-    from core.hub_widget import HubWidget, ToolInfo
-
-    tools = [
-        ToolInfo(
-            id="walmart_shipment_reconcile",
-            name="发货数量核对（Walmart）",
-            description="核对箱唛实际发货数量和发货计划表是否一致，并按 SKU 拆分箱唛 PDF",
-            build_panel=WalmartReconcilePanel,
-        ),
-    ]
-    return HubWidget(tools)
+    def stop_running_tasks(self):
+        # 关软件的时候被 MainWindow.closeEvent 调用。用协作式取消（设个 cancel_event，
+        # run_reconcile 自己发现了会尽快收尾并杀掉子进程），不用 QThread.terminate()——
+        # 那个在线程卡在 concurrent.futures 等待里时经常直接卡死，试过了。
+        # 等几秒钟让它真正收尾；就算超时了，MainWindow 那边最后还有 os._exit() 兜底，
+        # 保证进程一定会退出，不会因为这里等太久而卡住关闭软件。
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel()
+            self._worker.wait(5000)

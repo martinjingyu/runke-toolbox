@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +43,7 @@ class RunReport:
     skipped_pages: dict[str, int]  # 输入文件名 -> 跳过的非箱标签页数（比如托盘汇总页）
     split_pdf_paths: list[Path]
     unresolved_gtins: set[str]  # OCR 读不出来、或者翻译表查不到对应货号的 GTIN
+    cancelled: bool = False
 
 
 def run(
@@ -50,10 +52,15 @@ def run(
     plan_path: str | Path,
     output_dir: str | Path,
     progress_callback: Callable[[int, int], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> RunReport:
     """progress_callback(done, total)：total 是所有输入 PDF 的总页数，done 随着每一页解码
     完成往上涨——这是整个流程里最耗时的一步（条码解码），其余步骤（翻译、匹配、写文件）都很快，
     没有单独占进度条的必要，跑完这部分基本就等于跑完了。
+
+    cancel_event：中途设了这个（比如用户关了软件），会尽快停下来并杀掉还在跑的子进程，
+    返回一个 cancelled=True 的 RunReport（结果不完整，调用方不该展示它，只是让函数能正常
+    退出而不是被硬中断在不确定的状态）。
     """
     require_tesseract()
 
@@ -83,15 +90,23 @@ def run(
         if progress_callback is not None:
             progress_callback(done_pages, total_pages)
 
+    def _cancelled_report() -> RunReport:
+        return RunReport(results=[], skipped_pages={}, split_pdf_paths=[], unresolved_gtins=set(), cancelled=True)
+
     # gtin -> 仓库(=输入文件名，不含扩展名) -> [(pdf路径, BoxLabel), ...]
     by_gtin_warehouse: dict[str, dict[str, list[tuple[Path, BoxLabel]]]] = defaultdict(lambda: defaultdict(list))
     skipped_pages: dict[str, int] = {}
     for pdf_path in pdf_paths:
+        if cancel_event is not None and cancel_event.is_set():
+            return _cancelled_report()
         warehouse = pdf_path.stem
-        labels, skipped = parse_box_labels(pdf_path, on_page_done=_on_page_done)
+        labels, skipped = parse_box_labels(pdf_path, on_page_done=_on_page_done, cancel_event=cancel_event)
         skipped_pages[pdf_path.name] = skipped
         for label in labels:
             by_gtin_warehouse[label.gtin][warehouse].append((pdf_path, label))
+
+    if cancel_event is not None and cancel_event.is_set():
+        return _cancelled_report()
 
     # 每个 GTIN 只 OCR 一次代表页（同一个 GTIN 的箱子必然是同一个 SKU），翻译成货号；
     # OCR 失败或翻译表查不到，就记下来提醒用户，不静默丢弃

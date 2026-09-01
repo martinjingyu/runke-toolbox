@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import platform
 import re
+import threading
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,7 +41,14 @@ from PIL import Image  # noqa: E402
 try:
     import pytesseract
 
-    _HAS_TESSERACT = True
+    from .tesseract_dependency import locate_tesseract
+
+    # 不能只靠 PATH 找 tesseract.exe——实测在 Windows 上，装完 Tesseract 之后 PATH
+    # 没刷新成功是常见情况，这里直接把找到的完整路径显式告诉 pytesseract，绕开 PATH。
+    _tesseract_path = locate_tesseract()
+    if _tesseract_path:
+        pytesseract.pytesseract.tesseract_cmd = _tesseract_path
+    _HAS_TESSERACT = _tesseract_path is not None
 except ImportError:
     _HAS_TESSERACT = False
 
@@ -54,11 +62,15 @@ _SKU_OCR_DPI = 300
 
 
 def require_tesseract() -> None:
-    """核对流程一开始就调用一下，没装 Tesseract 就直接报错说清楚原因，
-    不要等跑到一半、所有 SKU 都读不出来才让人自己发现。"""
+    """核对流程一开始就调用一下，没装 Tesseract（或者装了但找不到 tesseract.exe）就直接
+    报错说清楚原因，不要等跑到一半、所有 SKU 都读不出来才让人自己发现——之前真实踩过这个坑：
+    pytesseract 这个 Python 包装好了，但底层的 Tesseract 引擎没装，OCR 每次都静默失败，
+    核对结果整批全部"查不到"，界面上看起来像是正常跑完了，其实数据是空的。
+    """
     if not _HAS_TESSERACT:
         raise RuntimeError(
-            "没有找到 Tesseract，没法从箱唛上读取 SKU（这次核对流程离不开这一步）。"
+            "没有找到 Tesseract（可能是 pytesseract 这个包没装，也可能是包装了但找不到 tesseract.exe），"
+            "没法从箱唛上读取 SKU，这次核对流程离不开这一步。"
             "Mac 上装：brew install tesseract；Windows 上装 UB-Mannheim 提供的安装包。"
         )
 
@@ -85,6 +97,7 @@ def parse_box_labels(
     dpi: int = 150,
     max_workers: int | None = None,
     on_page_done: Callable[[], None] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[list[BoxLabel], int]:
     """返回 (箱标签列表, 跳过的非箱标签页数)。
 
@@ -94,6 +107,10 @@ def parse_box_labels(
     on_page_done：每解完一页就调用一次（不管这页是箱标签还是被跳过），给界面上报进度用；
     用 as_completed 而不是 map，是因为 map 要按提交顺序把结果攒好才吐出来，没法在每一页
     真正完成的时候就立刻通知外面。
+
+    cancel_event：中途设了这个，会在当前这一批已提交的页面陆续完成的间隙尽快停下来，
+    并且把还没跑完的子进程直接杀掉——不能指望 QThread.terminate() 去掐断这个函数，实测
+    线程卡在 concurrent.futures 的等待里时，terminate() 经常会直接卡死，比不处理还糟。
     """
     pdf_path = str(pdf_path)
     page_count = get_page_count(pdf_path)
@@ -105,9 +122,14 @@ def parse_box_labels(
 
     labels: list[BoxLabel] = []
     skipped = 0
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    cancelled = False
+    pool = ProcessPoolExecutor(max_workers=workers)
+    try:
         futures = [pool.submit(_decode_page, pdf_path, i, dpi) for i in range(page_count)]
         for future in as_completed(futures):
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                break
             result = future.result()
             if result is None:
                 skipped += 1
@@ -115,6 +137,14 @@ def parse_box_labels(
                 labels.append(result)
             if on_page_done is not None:
                 on_page_done()
+    finally:
+        if cancelled:
+            for proc in list(getattr(pool, "_processes", {}).values()):
+                if proc.is_alive():
+                    proc.kill()
+            pool.shutdown(wait=False, cancel_futures=True)
+        else:
+            pool.shutdown(wait=True)
     return labels, skipped
 
 

@@ -1,3 +1,6 @@
+# 这是 Mac 开发环境用的，故意比 requirements.txt（Windows 端用户装的那份，只有核心壳需要的
+# PySide6/PyYAML）多——开发/测试要能跑通所有工具（包括"发货数量核对"），所以把它的依赖也
+# 一起列在这里；真实用户的 Windows 电脑上这些是点开那个工具才按需安装的，不是一次装齐。
 name: runke-toolbox
 channels:
   - conda-forge
