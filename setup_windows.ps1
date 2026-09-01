@@ -38,6 +38,30 @@ function Get-PythonExe {
     return $null
 }
 
+function Add-ToUserPath {
+    # 把目录持久化地加进"当前用户"的 PATH（写注册表，不是只改当前进程），这样以后新开的
+    # 命令行窗口、双击 run_windows.bat 都能直接找到 python，不用每次都靠这个脚本兜底。
+    #
+    # 之前踩过的坑：python.org 安装器的 PrependPath=1 理论上会自动做这件事，但实测不总是
+    # 生效（跟 Windows 版本、安装器版本都有关系），所以这里不依赖它，自己再显式写一遍，
+    # 双重保险。
+    param([string[]]$Dirs)
+
+    $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+    if ($null -eq $userPath) { $userPath = "" }
+
+    $toAdd = $Dirs | Where-Object { $_ -and ($userPath -notlike "*$_*") }
+    if ($toAdd.Count -eq 0) { return }
+
+    $newUserPath = ($userPath.TrimEnd(";") + ";" + ($toAdd -join ";")).Trim(";")
+    [System.Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
+
+    # 同时更新当前这个 PowerShell 进程的 PATH，这次运行马上就能用，不用等重开窗口
+    $env:Path = ($toAdd -join ";") + ";" + $env:Path
+
+    Write-Host "已经把 Python 永久加到你账户的 PATH 里，以后新开的命令行窗口也能直接用 python 命令。"
+}
+
 Write-Host "== 第 1 步：检查 Python =="
 $systemPython = Get-PythonExe
 
@@ -50,23 +74,30 @@ if ($null -eq $systemPython) {
     Start-Process -FilePath $installerPath -ArgumentList "/quiet InstallAllUsers=0 PrependPath=1 Include_launcher=0 Include_test=0" -Wait
     Remove-Item $installerPath -ErrorAction SilentlyContinue
 
-    # 刚装完，当前这个 PowerShell 进程里的 PATH 还是旧的，从注册表重新读一遍
-    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "User") + ";" + `
-                [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+    # 不依赖 PATH 有没有刷新成功——python.org per-user 安装是固定装到这个目录，直接去这里找，
+    # 比"装完再搜 PATH 里有没有"更可靠
+    $installDir = Join-Path $env:LOCALAPPDATA "Programs\Python\Python311"
+    $installedPython = Join-Path $installDir "python.exe"
 
-    $systemPython = Get-PythonExe
-    if ($null -eq $systemPython) {
-        # 保险起见，per-user 安装的默认路径也试一下（不依赖 PATH 有没有刷新成功）
-        $fallback = Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"
-        if (Test-Path $fallback) {
-            $systemPython = $fallback
+    if (-not (Test-Path $installedPython)) {
+        # 版本号目录名以后可能变（比如升级到 3.12），保险起见搜一下
+        $pythonRoot = Join-Path $env:LOCALAPPDATA "Programs\Python"
+        $candidate = Get-ChildItem -Path $pythonRoot -Filter "python.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($candidate) {
+            $installedPython = $candidate.FullName
+            $installDir = $candidate.DirectoryName
         }
     }
-    if ($null -eq $systemPython) {
+
+    if (-not (Test-Path $installedPython)) {
         Write-Host ""
-        Write-Host "Python 应该是装好了，但这个窗口还没认到。请关掉这个窗口，重新打开一个，再双击一次 setup_windows.bat。"
+        Write-Host "Python 装完了但没找到 python.exe，安装本身可能失败了。请手动检查一下，或者重新运行一次这个脚本。"
         exit 1
     }
+
+    $systemPython = $installedPython
+    Add-ToUserPath -Dirs @($installDir, (Join-Path $installDir "Scripts"))
+
     Write-Host "Python 装好了：$systemPython"
 } else {
     Write-Host "已有可用的 Python：$systemPython"
