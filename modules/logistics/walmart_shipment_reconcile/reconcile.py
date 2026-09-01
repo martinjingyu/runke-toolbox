@@ -15,10 +15,11 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import fitz
 
-from .box_label import BoxLabel, ocr_single_sku, parse_box_labels, require_tesseract
+from .box_label import BoxLabel, get_page_count, ocr_single_sku, parse_box_labels, require_tesseract
 from .shipping_plan import parse_shipping_plan
 from .translation import normalize_sku, parse_translation
 
@@ -48,7 +49,12 @@ def run(
     translation_path: str | Path,
     plan_path: str | Path,
     output_dir: str | Path,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> RunReport:
+    """progress_callback(done, total)：total 是所有输入 PDF 的总页数，done 随着每一页解码
+    完成往上涨——这是整个流程里最耗时的一步（条码解码），其余步骤（翻译、匹配、写文件）都很快，
+    没有单独占进度条的必要，跑完这部分基本就等于跑完了。
+    """
     require_tesseract()
 
     output_dir = Path(output_dir)
@@ -67,13 +73,22 @@ def run(
         planned_by_key[(row.tracking_id, norm_sku)] += row.planned_quantity
         plan_display_sku.setdefault(norm_sku, row.sku)
 
+    pdf_paths = [Path(p) for p in pdf_paths]
+    total_pages = sum(get_page_count(p) for p in pdf_paths)
+    done_pages = 0
+
+    def _on_page_done() -> None:
+        nonlocal done_pages
+        done_pages += 1
+        if progress_callback is not None:
+            progress_callback(done_pages, total_pages)
+
     # gtin -> 仓库(=输入文件名，不含扩展名) -> [(pdf路径, BoxLabel), ...]
     by_gtin_warehouse: dict[str, dict[str, list[tuple[Path, BoxLabel]]]] = defaultdict(lambda: defaultdict(list))
     skipped_pages: dict[str, int] = {}
     for pdf_path in pdf_paths:
-        pdf_path = Path(pdf_path)
         warehouse = pdf_path.stem
-        labels, skipped = parse_box_labels(pdf_path)
+        labels, skipped = parse_box_labels(pdf_path, on_page_done=_on_page_done)
         skipped_pages[pdf_path.name] = skipped
         for label in labels:
             by_gtin_warehouse[label.gtin][warehouse].append((pdf_path, label))

@@ -36,6 +36,7 @@ _MISMATCH_COLOR = QColor("#F8CBAD")
 class _ReconcileWorker(QThread):
     succeeded = Signal(object)  # RunReport
     failed = Signal(str)
+    progress = Signal(int, int)  # done, total（页数）
 
     def __init__(self, pdf_paths: list[str], translation_path: str, plan_path: str, output_dir: str):
         super().__init__()
@@ -46,7 +47,13 @@ class _ReconcileWorker(QThread):
 
     def run(self):
         try:
-            report = run_reconcile(self._pdf_paths, self._translation_path, self._plan_path, self._output_dir)
+            report = run_reconcile(
+                self._pdf_paths,
+                self._translation_path,
+                self._plan_path,
+                self._output_dir,
+                progress_callback=lambda done, total: self.progress.emit(done, total),
+            )
             write_report_xlsx(report, Path(self._output_dir) / "核对结果.xlsx")
         except Exception as exc:  # 任何失败原因都要带回界面告诉用户，不能让线程默默死掉
             self.failed.emit(str(exc))
@@ -171,6 +178,7 @@ class WalmartReconcilePanel(QWidget):
 
         self._run_button.setEnabled(False)
         self._open_output_button.setEnabled(False)
+        self._progress.setRange(0, 0)  # 页数还没数出来之前，先显示忙碌样式，第一次进度回调后会切成百分比
         self._progress.show()
         self._status_label.setText("正在处理……箱唛页数多的话可能要几分钟，请耐心等待，不要关闭窗口。")
         self._table.setRowCount(0)
@@ -178,7 +186,16 @@ class WalmartReconcilePanel(QWidget):
         self._worker = _ReconcileWorker(self._pdf_paths, translation_path, plan_path, output_dir)
         self._worker.succeeded.connect(self._on_success)
         self._worker.failed.connect(self._on_failure)
+        self._worker.progress.connect(self._on_progress)
         self._worker.start()
+
+    def _on_progress(self, done: int, total: int):
+        if total <= 0:
+            return
+        if self._progress.maximum() != total:
+            self._progress.setRange(0, total)
+        self._progress.setValue(done)
+        self._status_label.setText(f"正在解析箱唛条码：{done}/{total} 页……")
 
     def _on_success(self, report: RunReport):
         self._progress.hide()
@@ -226,4 +243,16 @@ class WalmartReconcilePanel(QWidget):
 
 
 def build_panel() -> QWidget:
-    return WalmartReconcilePanel()
+    """物流仓库这个部门的入口——先看到工具列表，点进去才是具体某个工具的界面。
+    以后物流仓库加新工具，在这个列表里加一项 ToolInfo 就行，不用改 HubWidget。"""
+    from core.hub_widget import HubWidget, ToolInfo
+
+    tools = [
+        ToolInfo(
+            id="walmart_shipment_reconcile",
+            name="发货数量核对（Walmart）",
+            description="核对箱唛实际发货数量和发货计划表是否一致，并按 SKU 拆分箱唛 PDF",
+            build_panel=WalmartReconcilePanel,
+        ),
+    ]
+    return HubWidget(tools)

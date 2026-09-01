@@ -20,10 +20,10 @@ from __future__ import annotations
 import os
 import platform
 import re
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
-from itertools import repeat
 from pathlib import Path
+from typing import Callable
 
 import fitz
 
@@ -72,16 +72,31 @@ class BoxLabel:
     quantity: int
 
 
+def get_page_count(pdf_path: str | Path) -> int:
+    doc = fitz.open(str(pdf_path))
+    try:
+        return doc.page_count
+    finally:
+        doc.close()
+
+
 def parse_box_labels(
-    pdf_path: str | Path, dpi: int = 150, max_workers: int | None = None
+    pdf_path: str | Path,
+    dpi: int = 150,
+    max_workers: int | None = None,
+    on_page_done: Callable[[], None] | None = None,
 ) -> tuple[list[BoxLabel], int]:
     """返回 (箱标签列表, 跳过的非箱标签页数)。
 
     max_workers 不填的话用 CPU 核数——每页单独开一个 fitz 句柄去渲染+解码，
     是因为 fitz.Document 不支持跨进程/跨线程共享同一个句柄，各页之间必须完全独立。
+
+    on_page_done：每解完一页就调用一次（不管这页是箱标签还是被跳过），给界面上报进度用；
+    用 as_completed 而不是 map，是因为 map 要按提交顺序把结果攒好才吐出来，没法在每一页
+    真正完成的时候就立刻通知外面。
     """
     pdf_path = str(pdf_path)
-    page_count = _get_page_count(pdf_path)
+    page_count = get_page_count(pdf_path)
     if page_count == 0:
         return [], 0
 
@@ -91,20 +106,16 @@ def parse_box_labels(
     labels: list[BoxLabel] = []
     skipped = 0
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        for result in pool.map(_decode_page, repeat(pdf_path), range(page_count), repeat(dpi)):
+        futures = [pool.submit(_decode_page, pdf_path, i, dpi) for i in range(page_count)]
+        for future in as_completed(futures):
+            result = future.result()
             if result is None:
                 skipped += 1
             else:
                 labels.append(result)
+            if on_page_done is not None:
+                on_page_done()
     return labels, skipped
-
-
-def _get_page_count(pdf_path: str) -> int:
-    doc = fitz.open(pdf_path)
-    try:
-        return doc.page_count
-    finally:
-        doc.close()
 
 
 def _decode_page(pdf_path: str, page_index: int, dpi: int) -> BoxLabel | None:
