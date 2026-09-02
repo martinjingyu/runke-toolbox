@@ -16,3 +16,4 @@ dependencies:
       - Pillow
       - pylibdmtx
       - pytesseract
+      - requests

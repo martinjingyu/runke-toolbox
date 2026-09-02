@@ -5,3 +5,12 @@ storage:
   backend: local
   # local 后端的根目录，模块读写文件都相对这个目录
   local_root: data
+
+# modules/logistics/amazon_sp_api 用的凭证模板——这几项留空，真实值只写到 config.local.yaml
+# （不进 git）。字段说明见 Solution Provider Portal 申请下来的 App 详情页。
+amazon_sp_api:
+  client_id: ""
+  client_secret: ""
+  refresh_token: ""
+  marketplace_id: ATVPDKIKX0DER  # 美国站；加拿大站用 A2EUQ1WTGCTBG2
+  base_url: https://sellingpartnerapi-na.amazon.com

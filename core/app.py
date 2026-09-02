@@ -71,6 +71,10 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    # QSettings 靠这两个名字决定存到哪（Windows 是注册表，Mac/Linux 是一个 ini 文件）——
+    # 不设的话每次运行用的位置可能不一致，记住的东西（比如上次选过的文件路径）就会找不到。
+    app.setOrganizationName("runke")
+    app.setApplicationName("runke-toolbox")
     window = MainWindow()
     window.show()
     exit_code = app.exec()

@@ -27,6 +27,12 @@ def _build_fba_label_redact_panel() -> QWidget:
     return FbaLabelRedactPanel()
 
 
+def _build_shipment_plan_apply_panel() -> QWidget:
+    from .shipment_plan_apply.panel import ShipmentPlanApplyPanel
+
+    return ShipmentPlanApplyPanel()
+
+
 def build_panel() -> QWidget:
     tools = [
         ToolInfo(
@@ -50,6 +56,15 @@ def build_panel() -> QWidget:
             build_panel=_build_fba_label_redact_panel,
             dependencies=[
                 pip_package("pymupdf", import_name="fitz", display_name="PyMuPDF（读取/编辑 PDF）"),
+            ],
+        ),
+        ToolInfo(
+            id="shipment_plan_apply",
+            name="发货计划自动更新",
+            description="把运营提交的发货计划表导入，自动更新采购订单汇总表和发货计划汇总表",
+            build_panel=_build_shipment_plan_apply_panel,
+            dependencies=[
+                pip_package("openpyxl", display_name="openpyxl（读写 Excel）"),
             ],
         ),
     ]
