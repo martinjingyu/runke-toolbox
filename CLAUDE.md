@@ -278,6 +278,25 @@ MODULE_INFO = {
   `find_or_create_date_column`。—— 已经问过用户要不要换成 `xlwings`（遥控真实 Excel 来做，
   公式调整交给 Excel 自己处理）代替这套手写逻辑，用户选择继续用 openpyxl + 手写修正（更快、
   不依赖 Excel 安装），如果以后这套手写逻辑又踩到没覆盖的公式写法，可以重新考虑这个选项。
+- **`insert_rows`/`insert_cols` 同样不会像 Excel 那样自动处理"格式"**，这条差点造成大问题：
+  用户反馈"写入了新表但排版都没了"，一查是两个叠加的坑——① 新插入的那一整行/整列，格子本身
+  是完全没有任何样式（字体、填充色、边框、数字格式）的空白格子，需要手动从旁边的行/列把样式
+  抄过去（`copy()` 每个 `cell.font`/`.fill`/`.border`/`.alignment`/`.number_format`/
+  `.protection`，不能只抄 `.value`）；② 行高/列宽这种"整行/整列"级别的设置（`row_dimensions`/
+  `column_dimensions`，用行号/列字母当 key）**不会跟着插入操作一起往下/往右挪**——插入点以下
+  原来的行/列，格子内容和样式会正确挪过去（这个 openpyxl 做对了），但行高列宽的设置留在原来
+  的行号/列号上不动，插入之后要么新插入的行/列意外"继承"了不该属于它的旧设置，要么原来那一行/
+  列的设置丢了、变成默认值——必须手动把 `row_dimensions`/`column_dimensions` 从插入点开始
+  一个个往后挪一位（从最后一行/列开始往前处理，不然会覆盖还没读出来的旧值）。**这个坑用之前
+  那种"只复制 cell.value、不保留格式"生成的测试数据是发现不了的**——本项目早期为了测试方便
+  用 `ws.append(values)` 拆分出来的几份"（测试用）"参考文件本身就没有任何格式，所以这个问题
+  在开发阶段的测试里完全不会暴露，是用户拿真实的、有格式的生产文件测试才发现的。教训：凡是
+  会调用 `insert_rows`/`insert_cols` 的代码，测试数据必须是带真实格式的（哪怕是最简单的填色/
+  边框/行高），不能图省事只测"值对不对"；现在 `tests/test_shipment_plan_apply.py` 里
+  `test_shipment_summary_insert_above_preserves_formatting`/
+  `test_purchase_book_insert_date_column_preserves_formatting` 这两个测试专门锁定这条，
+  三份"（测试用）"参考文件也已经改成用"删除其它 sheet 再另存"的方式重新生成（保留完整格式），
+  不再是只复制值的版本。
 - **`QTableWidget.setHorizontalHeaderLabels()` 只接受字符串**，传非字符串（比如 Excel 表头本身
   就是 `datetime`，或者裸数字）会在 PySide6 底层报一堆
   `_pythonToCppCopy: Cannot copy-convert ... to C++` 的错误（不会崩溃，但表现出来就是各种

@@ -3,6 +3,7 @@ from pathlib import Path
 
 import openpyxl
 import pytest
+from openpyxl.styles import Border, PatternFill, Side
 
 from modules.logistics.shipment_plan_apply.column_utils import resolve_cell_value
 from modules.logistics.shipment_plan_apply.diff import run_and_capture_diff
@@ -247,6 +248,41 @@ def test_purchase_book_insert_date_column_preserves_formula_and_unrelated_rows(t
     assert row2.initial_remaining == 80 - 10  # 重新加载后公式算出来的未出货数量要正确
 
 
+def test_purchase_book_insert_date_column_preserves_formatting(tmp_path):
+    # 回归测试：跟 shipment_summary 那边同一类问题——insert_cols 新建出来的整列没有任何格式，
+    # 列宽这种"整列"级别的设置也不会跟着 insert_cols 自动往右挪。
+    path = tmp_path / "purchase.xlsx"
+    _write_purchase_book(path)
+    wb = openpyxl.load_workbook(path, data_only=False)
+    ws = wb.active
+
+    blue = PatternFill(start_color="0000FF", end_color="0000FF", fill_type="solid")
+    thin = Border(top=Side(style="thin"), bottom=Side(style="thin"))
+    for r in (1, 2, 3, 4):
+        for c in (6, 7):  # 两个已有日期列 F, G
+            ws.cell(row=r, column=c).fill = blue
+            ws.cell(row=r, column=c).border = thin
+    ws.column_dimensions["F"].width = 9.5
+    ws.column_dimensions["G"].width = 9.5
+    wb.save(path)
+
+    wb2 = openpyxl.load_workbook(path, data_only=False)
+    ws2 = wb2.active
+    book = PurchaseBook(ws2)
+    mid_col = book.find_or_create_date_column(dt.date(2024, 1, 15))  # 插在 F,G 之间
+    wb2.save(path)
+
+    wb3 = openpyxl.load_workbook(path, data_only=False)
+    ws3 = wb3.active
+    from openpyxl.utils import get_column_letter
+
+    assert ws3.column_dimensions["F"].width == 9.5  # 左边不受影响的列，原样不动
+    assert ws3.column_dimensions[get_column_letter(mid_col)].width == 9.5  # 新插入的列，抄了邻居的列宽
+    assert ws3.column_dimensions[get_column_letter(mid_col + 1)].width == 9.5  # 原来的 G 右移，列宽跟过去
+    assert ws3.cell(3, mid_col).fill.fgColor.rgb == "000000FF"
+    assert ws3.cell(3, mid_col).border.top.style == "thin"
+
+
 # ---------------------------------------------------------------------------
 # shipment_summary
 # ---------------------------------------------------------------------------
@@ -265,6 +301,44 @@ def _write_summary_book(path: Path):
     ws.append([None] * 4 + ["=SUBTOTAL(9,E2:E3)"] + [None] * 12)  # 模拟表底的合计行
     wb.save(path)
     return wb
+
+
+def test_shipment_summary_insert_above_preserves_formatting(tmp_path):
+    # 回归测试：真实文件是有格式的（字体、填充色、边框、行高），insert_rows 新建出来的空行
+    # 默认没有任何格式，而且行高这种"整行"级别的设置不会跟着 insert_rows 自动往下挪——之前
+    # 就是这两个问题导致用户反馈"写入了新表但排版都没了"。
+    path = tmp_path / "summary.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    headers = ["采购单号", "型号", "箱数", "箱容", "数量", "ZD", "发货时间", "状态",
+               "仓库", "FBA ID", "追踪编号", "备注", "货代", "出货单号", "so", "编号"]
+    ws.append(headers)
+    ws.append(["PO-1", "M1", 5, 3, 15, None, "待定", "未发货", None, None, None, None, None, None, None, None])
+    ws.append(["PO-2", "M2", 2, 3, 6, None, "待定", "未发货", None, None, None, None, None, None, None, None])
+
+    yellow = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+    thin = Border(top=Side(style="thin"), bottom=Side(style="thin"))
+    for c in range(1, len(headers) + 1):
+        ws.cell(row=2, column=c).fill = yellow
+        ws.cell(row=2, column=c).border = thin
+    ws.row_dimensions[2].height = 30
+    wb.save(path)
+
+    wb2 = openpyxl.load_workbook(path)
+    ws2 = wb2.active
+    book = ShipmentSummaryBook(ws2)
+    changes = book.apply_shipment("PO-1", "M1", 5, "ZD1", dt.date(2026, 9, 1))
+    wb2.save(path)
+
+    wb3 = openpyxl.load_workbook(path)
+    ws3 = wb3.active
+    new_row, pending_row = changes[0].new_row, changes[0].pending_row
+    assert ws3.cell(new_row, 1).fill.fgColor.rgb == "00FFFF00"
+    assert ws3.cell(new_row, 1).border.top.style == "thin"
+    assert ws3.row_dimensions[new_row].height == 30
+    assert ws3.cell(pending_row, 1).fill.fgColor.rgb == "00FFFF00"
+    assert ws3.cell(pending_row, 1).border.top.style == "thin"
+    assert ws3.row_dimensions[pending_row].height == 30
 
 
 def test_shipment_summary_insert_above_reindexes_formulas(tmp_path):

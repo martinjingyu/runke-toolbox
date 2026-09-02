@@ -22,7 +22,9 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass, field
 
-from openpyxl.utils import get_column_letter
+from copy import copy
+
+from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from .column_utils import HeaderNotFoundError, column_index_map, find_header_row, require_columns
@@ -188,7 +190,18 @@ class PurchaseBook:
                 insert_at = c
                 break
 
+        # 插入之前先记下要照抄格式的那一列（本来在插入点左边的那一列，插入之后位置不变，
+        # 还是原来的列号；插入点正好是日期区间最左边、左边没有可抄的日期列时，就抄插入之后
+        # 落在右边的那一列）——旧列右移之后这个"左边列号"不会跟着变，插入完了正好能直接用。
+        style_source = insert_at - 1 if insert_at - 1 >= self.date_col_start else None
+
         self.ws.insert_cols(insert_at)
+        # insert_cols 只搬单元格本身，"整列"级别的设置（列宽等）和新插入的这一整列的格子样式
+        # （字体/填充/边框），都不会像 Excel 那样自动跟着处理——列宽挂在列号上，列号错位了但
+        # 设置没跟着挪；新插入的这一整列每一行都是没有任何格式的空白格子，直接看会很突兀。
+        self._shift_column_dimensions(insert_at)
+        self._copy_column_style(insert_at, style_source if style_source is not None else insert_at + 1)
+
         self.ws.cell(row=self.header_row, column=insert_at, value=dt.datetime.combine(target_date, dt.time()))
         self.ws.cell(row=self.sub_header_row, column=insert_at, value=SUB_HEADER_LABEL)
 
@@ -198,6 +211,48 @@ class PurchaseBook:
         self._rewrite_remaining_formulas()
 
         return insert_at
+
+    def _shift_column_dimensions(self, inserted_at: int) -> None:
+        # 从最右边的列开始往左处理，不然后面的赋值会覆盖掉还没读出来的旧值（跟
+        # shipment_summary.py 里 _shift_row_heights 是同一个道理，只是行列换了个方向）。
+        existing_cols = sorted(
+            (
+                idx
+                for letter in self.ws.column_dimensions
+                if (idx := column_index_from_string(letter)) >= inserted_at
+            ),
+            reverse=True,
+        )
+        for idx in existing_cols:
+            src = self.ws.column_dimensions[get_column_letter(idx)]
+            dest = self.ws.column_dimensions[get_column_letter(idx + 1)]
+            dest.width = src.width
+            dest.hidden = src.hidden
+            dest.outlineLevel = src.outlineLevel
+            dest.collapsed = src.collapsed
+        inserted_letter = get_column_letter(inserted_at)
+        if inserted_letter in self.ws.column_dimensions:
+            del self.ws.column_dimensions[inserted_letter]
+
+    def _copy_column_style(self, dest_col: int, src_col: int) -> None:
+        if self.ws.max_row is None:
+            return
+        src_letter = get_column_letter(src_col)
+        if src_letter in self.ws.column_dimensions:
+            src_dim = self.ws.column_dimensions[src_letter]
+            dest_dim = self.ws.column_dimensions[get_column_letter(dest_col)]
+            dest_dim.width = src_dim.width
+        for r in range(1, self.ws.max_row + 1):
+            src_cell = self.ws.cell(row=r, column=src_col)
+            if not src_cell.has_style:
+                continue
+            dest_cell = self.ws.cell(row=r, column=dest_col)
+            dest_cell.font = copy(src_cell.font)
+            dest_cell.fill = copy(src_cell.fill)
+            dest_cell.border = copy(src_cell.border)
+            dest_cell.alignment = copy(src_cell.alignment)
+            dest_cell.number_format = src_cell.number_format
+            dest_cell.protection = copy(src_cell.protection)
 
     def _rewrite_remaining_formulas(self) -> None:
         qty_letter = get_column_letter(self.order_qty_col)

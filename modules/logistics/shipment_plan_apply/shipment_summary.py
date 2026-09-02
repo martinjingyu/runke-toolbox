@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+from copy import copy
 from dataclasses import dataclass
 
 from openpyxl.worksheet.worksheet import Worksheet
@@ -198,6 +199,10 @@ class ShipmentSummaryBook:
             # 跟着往下调整——插入点以下所有行（不只是待定行）都要先把这类公式修好，不然
             # 插入点以下所有行的 CBM/总材重/总实重/DP 等公式都会读到错位的旧数据。
             self._reindex_shifted_rows(new_row)
+            # insert_rows 同样不会把"整行"级别的设置（这里主要是行高）跟着往下挪——这些设置
+            # 挂在行号上，行号错位了但设置留在原地不动，插入点以下每一行的行高会全部错位
+            # （挪到了它下面那一行身上）。
+            self._shift_row_heights(new_row)
             self._copy_row_with_reindex(new_row, template_row)
             self._set_explicit_fields(new_row, order_no, model, quantity, boxes, zd, ship_date, NEW_STATUS)
             self._blank_fields(new_row)
@@ -256,13 +261,43 @@ class ShipmentSummaryBook:
                     if new_value != value:
                         cell.value = new_value
 
+    def _shift_row_heights(self, inserted_at: int) -> None:
+        # insert_rows 只搬了单元格本身，"整行"级别的设置（这里主要是行高，隐藏/大纲级别顺带
+        # 一起处理）挂在行号上，行号错位了但设置没跟着挪——要从最后一行开始往前处理，不然
+        # 后面的赋值会覆盖掉还没读出来的旧值。
+        existing_rows = sorted(
+            (r for r in self.ws.row_dimensions if r >= inserted_at), reverse=True
+        )
+        for r in existing_rows:
+            src = self.ws.row_dimensions[r]
+            dest = self.ws.row_dimensions[r + 1]
+            dest.height = src.height
+            dest.hidden = src.hidden
+            dest.outlineLevel = src.outlineLevel
+            dest.collapsed = src.collapsed
+        if inserted_at in self.ws.row_dimensions:
+            del self.ws.row_dimensions[inserted_at]
+
     def _copy_row_with_reindex(self, dest_row: int, src_row: int) -> None:
+        # 整行复制：格式（字体/填充/边框/对齐/数字格式）也要一起抄，不然新插入的行会是一整行
+        # 没有任何样式的空白格子，跟旁边的行观感完全不一样——insert_rows 新建出来的空行本来
+        # 就是没有任何格式的。
         max_col = self.ws.max_column
         for c in range(1, max_col + 1):
-            value = self.ws.cell(row=src_row, column=c).value
+            src_cell = self.ws.cell(row=src_row, column=c)
+            dest_cell = self.ws.cell(row=dest_row, column=c)
+            value = src_cell.value
             if isinstance(value, str) and value.startswith("="):
                 value = _reindex_formula(value, src_row, dest_row)
-            self.ws.cell(row=dest_row, column=c, value=value)
+            dest_cell.value = value
+            if src_cell.has_style:
+                dest_cell.font = copy(src_cell.font)
+                dest_cell.fill = copy(src_cell.fill)
+                dest_cell.border = copy(src_cell.border)
+                dest_cell.alignment = copy(src_cell.alignment)
+                dest_cell.number_format = src_cell.number_format
+                dest_cell.protection = copy(src_cell.protection)
+        self.ws.row_dimensions[dest_row].height = self.ws.row_dimensions[src_row].height
 
     def _set_explicit_fields(
         self, row: int, order_no: str, model: str, quantity: int, boxes, zd: str, ship_date: dt.date, status: str
