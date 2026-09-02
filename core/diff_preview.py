@@ -1,12 +1,14 @@
 """可复用的"改动预览"组件：红色显示变化前，绿色显示变化后，按一组"识别字段"（比如订单号+
 型号）把同一条记录的变化前/变化后放在一起，自动隐藏两边完全没变化的列，可以指定一个字段
 允许直接在表格里编辑（改了立刻写回对应的 openpyxl worksheet，不用等外面"确认写入"再收集）。
+表头筛选是 Excel 风格的：每一列表头右边有个小箭头，点开是"搜索框 + 逐个值的勾选列表"，
+不是一个笼统的全局搜索框。
 
 给"读一批 Excel 数据、算出一批要写的改动、写之前先给人看一眼确认"这种流程用的——
 `modules/logistics/shipment_plan_apply` 就是这么用的（见该模块的 panel.py），以后哪个模块
 有类似"改真实业务数据之前先预览"的需求，直接复用这个组件，不用重新写一遍表格渲染、分组、
-隐藏没变化的列、可编辑字段、筛选这些逻辑——这些跟"发货计划"这个具体业务完全无关，纯粹是
-"两份数据摆在一起对比着看"的通用需要。
+隐藏没变化的列、可编辑字段、Excel 风格表头筛选这些逻辑——这些跟"发货计划"这个具体业务完全
+无关，纯粹是"两份数据摆在一起对比着看"的通用需要。
 
 典型用法：
 
@@ -28,17 +30,23 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass, field
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QPoint, QRect, Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QCheckBox,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
-    QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMenu,
+    QPushButton,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
+    QWidget,
+    QWidgetAction,
 )
 
 REMOVED_COLOR = QColor("#F8CBAD")  # 变化前
@@ -72,9 +80,132 @@ class DiffTable:
     after_rows: list[dict] = field(default_factory=list)
 
 
+class _ColumnFilterMenu(QMenu):
+    """点表头箭头弹出来的那个菜单：搜索框 + 全选 + 逐个值的勾选列表 + 确定/取消，
+    跟 Excel 筛选下拉框长得基本一样。
+    """
+
+    applied = Signal(set)  # 点"确定"时发出，参数是勾选中的值集合
+
+    def __init__(self, values: list[str], selected: set[str] | None, parent=None):
+        super().__init__(parent)
+        all_values = set(values)
+        selected = all_values if selected is None else selected
+
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        search_edit = QLineEdit()
+        search_edit.setPlaceholderText("搜索")
+        layout.addWidget(search_edit)
+
+        select_all_cb = QCheckBox("全选")
+        layout.addWidget(select_all_cb)
+
+        list_widget = QListWidget()
+        list_widget.setMaximumHeight(240)
+        checks: dict[str, QCheckBox] = {}
+        for v in values:
+            item = QListWidgetItem(list_widget)
+            cb = QCheckBox(v if v else "(空白)")
+            cb.setChecked(v in selected)
+            list_widget.setItemWidget(item, cb)
+            checks[v] = cb
+        layout.addWidget(list_widget)
+
+        select_all_cb.setChecked(all(cb.isChecked() for cb in checks.values()) if checks else True)
+
+        def sync_select_all() -> None:
+            select_all_cb.blockSignals(True)
+            select_all_cb.setChecked(all(cb.isChecked() for cb in checks.values()) if checks else True)
+            select_all_cb.blockSignals(False)
+
+        for cb in checks.values():
+            cb.toggled.connect(sync_select_all)
+
+        def toggle_all(checked: bool) -> None:
+            for i in range(list_widget.count()):
+                if not list_widget.item(i).isHidden():
+                    checks[values[i]].setChecked(checked)
+
+        select_all_cb.toggled.connect(toggle_all)
+
+        def do_search(text: str) -> None:
+            text = text.strip().lower()
+            for i in range(list_widget.count()):
+                cb = checks[values[i]]
+                list_widget.item(i).setHidden(bool(text) and text not in cb.text().lower())
+
+        search_edit.textChanged.connect(do_search)
+
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("确定")
+        cancel_btn = QPushButton("取消")
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        def do_apply() -> None:
+            self.applied.emit({v for v, cb in checks.items() if cb.isChecked()})
+            self.close()
+
+        ok_btn.clicked.connect(do_apply)
+        cancel_btn.clicked.connect(self.close)
+
+        action = QWidgetAction(self)
+        action.setDefaultWidget(widget)
+        self.addAction(action)
+
+
+class _FilterHeaderView(QHeaderView):
+    """表头右边画一个小箭头，点了发 filterRequested；哪一列当前有生效的筛选，箭头会变色。"""
+
+    filterRequested = Signal(int)
+    _ARROW = "▾"
+    _ICON_W = 16
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self.setSectionsClickable(True)
+        self._active_columns: set[int] = set()
+
+    def set_active(self, logical_index: int, active: bool) -> None:
+        if active:
+            self._active_columns.add(logical_index)
+        else:
+            self._active_columns.discard(logical_index)
+        self.updateSection(logical_index)
+
+    def reset_active(self) -> None:
+        self._active_columns.clear()
+
+    def _arrow_rect(self, logical_index: int) -> QRect:
+        left = self.sectionViewportPosition(logical_index)
+        width = self.sectionSize(logical_index)
+        return QRect(left + width - self._ICON_W - 2, 0, self._ICON_W, self.height())
+
+    def mousePressEvent(self, event) -> None:
+        idx = self.logicalIndexAt(event.pos())
+        if idx > 0 and self._arrow_rect(idx).contains(event.pos()):
+            self.filterRequested.emit(idx)
+            return
+        super().mousePressEvent(event)
+
+    def paintSection(self, painter, rect, logical_index) -> None:
+        super().paintSection(painter, rect, logical_index)
+        if logical_index <= 0:
+            return  # 第 0 列是"变化前/变化后"标记列，不需要筛选箭头
+        painter.save()
+        painter.setPen(QColor("#1a73e8") if logical_index in self._active_columns else QColor(140, 140, 140))
+        painter.drawText(self._arrow_rect(logical_index), Qt.AlignmentFlag.AlignCenter, self._ARROW)
+        painter.restore()
+
+
 class DiffPreviewGroup(QGroupBox):
-    """一个"标题 + 筛选框 + 变化前/变化后对比表格"的完整组件，本身就是一个 QGroupBox，
-    直接 addWidget 进布局就行。
+    """一个"标题 + 变化前/变化后对比表格（Excel 风格表头筛选）"的完整组件，本身就是一个
+    QGroupBox，直接 addWidget 进布局就行。
     """
 
     itemEdited = Signal()  # 可编辑字段被人改了一次就发一次，方便外面标记"有未保存的手工修改"
@@ -89,15 +220,9 @@ class DiffPreviewGroup(QGroupBox):
         super().__init__(title, parent)
         self._key_fields = key_fields
         self._editable_field = editable_field
+        self._column_filters: dict[int, set[str]] = {}  # 列号(含第0列标记列) -> 允许显示的值集合
 
         layout = QVBoxLayout(self)
-
-        filter_row = QHBoxLayout()
-        filter_row.addWidget(QLabel("筛选"))
-        self._filter_edit = QLineEdit()
-        self._filter_edit.setPlaceholderText("输入关键字，只看匹配的那几条")
-        filter_row.addWidget(self._filter_edit)
-        layout.addLayout(filter_row)
 
         self._table = QTableWidget(0, 0)
         # 表格整体允许编辑，但具体哪个格子能不能改，由每个格子自己的 ItemIsEditable 标志决定
@@ -105,11 +230,12 @@ class DiffPreviewGroup(QGroupBox):
         self._table.setEditTriggers(
             QTableWidget.EditTrigger.DoubleClicked | QTableWidget.EditTrigger.EditKeyPressed
         )
-        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self._header = _FilterHeaderView(self._table)
+        self._header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self._header.filterRequested.connect(self._show_column_filter)
+        self._table.setHorizontalHeader(self._header)
         self._table.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self._table)
-
-        self._filter_edit.textChanged.connect(self._apply_filter)
 
     @property
     def table(self) -> QTableWidget:
@@ -119,7 +245,8 @@ class DiffPreviewGroup(QGroupBox):
     def clear(self) -> None:
         self._table.setRowCount(0)
         self._table.setColumnCount(0)
-        self._filter_edit.clear()
+        self._column_filters.clear()
+        self._header.reset_active()
 
     def fill(self, diff: DiffTable, ws=None, col_index: int | None = None) -> None:
         """按 key_fields 分组渲染 diff；ws/col_index 是 editable_field 要写回的实际工作表和列号，
@@ -134,6 +261,9 @@ class DiffPreviewGroup(QGroupBox):
         的错误，所以表头文字要单独转一次字符串；查具体某一格的值还是要用原始（没转字符串的）
         header 去 row.get(h) 找。
         """
+        self._column_filters.clear()
+        self._header.reset_active()
+
         key_fields = self._key_fields
         editable_field = self._editable_field
 
@@ -226,28 +356,67 @@ class DiffPreviewGroup(QGroupBox):
         ws.cell(row=row_index, column=col_index, value=item.text())
         self.itemEdited.emit()
 
-    def _apply_filter(self, text: str) -> None:
-        # 按组过滤：一组（一条变化前 + 它对应的几条变化后）里只要有一格命中关键字，整组都留着，
-        # 不会出现"变化前显示、对应的变化后被筛掉了"这种看不完整的情况。
+    # ---- Excel 风格表头筛选 ----
+
+    def _show_column_filter(self, col_index: int) -> None:
         table = self._table
-        text = text.strip().lower()
+        values: list[str] = []
+        seen: set[str] = set()
+        for r in range(table.rowCount()):
+            item = table.item(r, col_index)
+            text = item.text() if item is not None else ""
+            if text not in seen:
+                seen.add(text)
+                values.append(text)
+        values.sort(key=lambda v: (v == "", v))  # 空值排最后，其余按字面顺序
+
+        menu = _ColumnFilterMenu(values, self._column_filters.get(col_index), self)
+        menu.applied.connect(lambda selected: self._on_column_filter_applied(col_index, selected, values))
+
+        pos = self._header.mapToGlobal(
+            QPoint(self._header.sectionViewportPosition(col_index), self._header.height())
+        )
+        menu.exec(pos)
+
+    def _on_column_filter_applied(self, col_index: int, selected: set[str], all_values: list[str]) -> None:
+        if selected == set(all_values):
+            self._column_filters.pop(col_index, None)
+            self._header.set_active(col_index, False)
+        else:
+            self._column_filters[col_index] = selected
+            self._header.set_active(col_index, True)
+        self._recompute_visibility()
+
+    def _recompute_visibility(self) -> None:
+        # 按组过滤：一组（一条变化前 + 它对应的几条变化后）里，只要有一行在每一个开了筛选的列上
+        # 都命中，这一组就整体保留——不会出现"变化前留着、对应的变化后被筛没了"这种看不完整的
+        # 情况（变化前后同一列的值本来就可能不一样，这正是要对比的东西，所以不能要求每一行
+        # 自己都满足所有筛选条件，而是整组只要有代表命中就行）。
+        table = self._table
         row_count = table.rowCount()
-        if not text:
+
+        if not self._column_filters:
             for r in range(row_count):
                 table.setRowHidden(r, False)
             return
 
-        matching_groups: set = set()
+        groups: dict[int, list[int]] = {}
         for r in range(row_count):
             marker = table.item(r, 0)
             group_id = marker.data(_GROUP_ROLE) if marker else None
-            for c in range(table.columnCount()):
-                cell = table.item(r, c)
-                if cell is not None and text in cell.text().lower():
-                    matching_groups.add(group_id)
+            groups.setdefault(group_id, []).append(r)
+
+        visible_groups: set = set()
+        for group_id, rows in groups.items():
+            ok = True
+            for col, allowed in self._column_filters.items():
+                if not any((table.item(r, col).text() if table.item(r, col) else "") in allowed for r in rows):
+                    ok = False
                     break
+            if ok:
+                visible_groups.add(group_id)
 
         for r in range(row_count):
             marker = table.item(r, 0)
             group_id = marker.data(_GROUP_ROLE) if marker else None
-            table.setRowHidden(r, group_id not in matching_groups)
+            table.setRowHidden(r, group_id not in visible_groups)

@@ -26,7 +26,6 @@ from .shipment_templates import PlanLine
 class PlanItem:
     line: PlanLine
     huohao: str | None = None
-    used_variant: bool = False
     allocations: list[Allocation] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -71,15 +70,12 @@ def build_plan(
             continue
 
         item.huohao = huohao
-        variant = lookup.variant_of(huohao)
-        outcome = purchase_book.allocate(huohao, line.quantity, variant)
+        outcome = purchase_book.allocate(huohao, line.quantity)
         item.allocations = outcome.allocations
-        item.used_variant = outcome.used_variant
 
         if outcome.shortfall > 0:
-            variant_note = f"（含变体货号「{variant}」）" if variant else ""
             item.errors.append(
-                f"{_line_label(line)}：货号「{huohao}」{variant_note}相关采购订单的未出货数量"
+                f"{_line_label(line)}：货号「{huohao}」相关采购订单的未出货数量"
                 f"加起来还差 {outcome.shortfall} 个，凑不够这次要发的 {line.quantity} 个"
             )
 

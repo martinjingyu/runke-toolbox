@@ -12,8 +12,10 @@
 
 分摊规则：同一个货号（型号）可能对应好几笔采购订单，按采购日期从早到晚，先把早的写满，
 写满了（未出货数量到 0）就换下一笔。如果找不到货号对应的订单，或者所有能找到的订单加起来
-的未出货数量还是不够这次要发的数量，调用方要么换一个"变体"货号重试，要么整体报错——具体
-决策不在这个模块里做，这里只负责"给定一个型号能分摊出多少、还差多少"。
+的未出货数量还是不够这次要发的数量，就是真的缺货，报 shortfall 让调用方报错，不找别的货号
+顶替——"变体"字段标的是"同一造型不同颜色"的分组，不是库存可以互换的依据（核对过真实数据，
+不同颜色的货没法互相顶替发货），所以分摊只在同一个货号自己名下的订单里找，这里只负责
+"给定一个型号能分摊出多少、还差多少"。
 """
 from __future__ import annotations
 
@@ -75,7 +77,6 @@ class Allocation:
 class AllocationOutcome:
     allocations: list[Allocation] = field(default_factory=list)
     shortfall: int = 0
-    used_variant: bool = False
 
 
 class PurchaseBook:
@@ -141,29 +142,20 @@ class PurchaseBook:
 
     # ---- 分摊 ----
 
-    def allocate(
-        self, model: str, quantity_needed: int, variant_model: str | None = None
-    ) -> AllocationOutcome:
+    def allocate(self, model: str, quantity_needed: int) -> AllocationOutcome:
         outcome = AllocationOutcome()
         remaining_need = quantity_needed
 
-        for is_variant, candidate_model in ((False, model), (True, variant_model)):
-            if not candidate_model:
-                continue
-            for row_obj in self.by_model.get(candidate_model, []):
-                if remaining_need <= 0:
-                    break
-                avail = row_obj.remaining
-                if avail <= 0:
-                    continue
-                take = min(avail, remaining_need)
-                row_obj.consumed_this_run += take
-                outcome.allocations.append(Allocation(row=row_obj, quantity=take))
-                remaining_need -= take
-                if is_variant:
-                    outcome.used_variant = True
+        for row_obj in self.by_model.get(model, []):
             if remaining_need <= 0:
                 break
+            avail = row_obj.remaining
+            if avail <= 0:
+                continue
+            take = min(avail, remaining_need)
+            row_obj.consumed_this_run += take
+            outcome.allocations.append(Allocation(row=row_obj, quantity=take))
+            remaining_need -= take
 
         outcome.shortfall = remaining_need
         return outcome

@@ -145,27 +145,25 @@ def test_parse_overseas_plan(tmp_path):
 def _write_product_info(path: Path, rows: list[tuple]) -> None:
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.append(["AMZ-SKU", "RK-SKU", "同款", "变体"])
+    ws.append(["AMZ-SKU", "RK-SKU", "同款"])
     for row in rows:
         ws.append(list(row))
     wb.save(path)
 
 
-def test_product_lookup_resolve_and_variant(tmp_path):
+def test_product_lookup_resolve(tmp_path):
     path = tmp_path / "product.xlsx"
     _write_product_info(
         path,
         [
-            ("AMZ-1", "RK-1", "HH-1", "HH-2"),
-            ("AMZ-2", "RK-2", "HH-2", None),
+            ("AMZ-1", "RK-1", "HH-1"),
+            ("AMZ-2", "RK-2", "HH-2"),
         ],
     )
     lookup = load_product_lookup(path)
     assert lookup.resolve("AMZ", "AMZ-1") == "HH-1"
     assert lookup.resolve("RK", "RK-2") == "HH-2"
     assert lookup.resolve("RK", "不存在") is None
-    assert lookup.variant_of("HH-1") == "HH-2"
-    assert lookup.variant_of("HH-2") is None  # 变体等于自己（或没填）时不算兜底
 
 
 def test_product_lookup_raises_on_conflicting_mapping(tmp_path):
@@ -173,8 +171,8 @@ def test_product_lookup_raises_on_conflicting_mapping(tmp_path):
     _write_product_info(
         path,
         [
-            ("AMZ-1", "RK-1", "HH-1", None),
-            ("AMZ-1", "RK-9", "HH-9", None),  # 同一个 AMZ-SKU 映射到两个不同货号
+            ("AMZ-1", "RK-1", "HH-1"),
+            ("AMZ-1", "RK-9", "HH-9"),  # 同一个 AMZ-SKU 映射到两个不同货号
         ],
     )
     with pytest.raises(ProductLookupError):
@@ -224,18 +222,6 @@ def test_purchase_book_reports_shortfall(tmp_path):
 
     outcome = book.allocate("M1", 500)
     assert outcome.shortfall == 500 - 80 - 50
-
-
-def test_purchase_book_variant_fallback(tmp_path):
-    path = tmp_path / "purchase.xlsx"
-    _write_purchase_book(path)
-    wb = openpyxl.load_workbook(path, data_only=False)
-    book = PurchaseBook(wb.active)
-
-    outcome = book.allocate("不存在的货号", 30, variant_model="M1")
-    assert outcome.shortfall == 0
-    assert outcome.used_variant is True
-    assert outcome.allocations[0].row.order_no == "PO-EARLY"
 
 
 def test_purchase_book_insert_date_column_preserves_formula_and_unrelated_rows(tmp_path):
@@ -435,7 +421,7 @@ def test_shipment_summary_quantity_exceeding_pending_raises(tmp_path):
 
 def test_planner_and_diff_end_to_end(tmp_path):
     product_path = tmp_path / "product.xlsx"
-    _write_product_info(product_path, [("AMZ-1", "RK-1", "M1", None)])
+    _write_product_info(product_path, [("AMZ-1", "RK-1", "M1")])
     lookup = load_product_lookup(product_path)
 
     purchase_path = tmp_path / "purchase.xlsx"
@@ -475,7 +461,7 @@ def test_planner_and_diff_end_to_end(tmp_path):
 
 def test_planner_blocks_whole_batch_on_shortfall(tmp_path):
     product_path = tmp_path / "product.xlsx"
-    _write_product_info(product_path, [("AMZ-1", "RK-1", "M1", None)])
+    _write_product_info(product_path, [("AMZ-1", "RK-1", "M1")])
     lookup = load_product_lookup(product_path)
 
     purchase_path = tmp_path / "purchase.xlsx"
