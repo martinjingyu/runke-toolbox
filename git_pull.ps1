@@ -2,6 +2,14 @@
 
 Set-Location -Path $PSScriptRoot
 
+# --- 二次确认：这个脚本会用服务器上的内容覆盖、删除本地文件，误触后果比较大 ---
+$CONFIRM_PASSWORD = "123"
+$inputPassword = Read-Host "此操作会用服务器内容覆盖本地文件（含删除本地多出的文件），请输入密码确认"
+if ($inputPassword -ne $CONFIRM_PASSWORD) {
+    Write-Error "密码不对，已取消拉取。"
+    exit 1
+}
+
 # --- 从服务器拉取项目 ---
 $NAS_UNC = "\\RK\公共文件"
 $NAS_SOURCE_DIR = Join-Path $NAS_UNC "个人\黄靖禺\runke-toolbox"

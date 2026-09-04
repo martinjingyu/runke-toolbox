@@ -67,3 +67,16 @@ Get-ChildItem -Path $NAS_TARGET_DIR -Recurse -Directory |
     Remove-Item -Force
 
 Write-Host "完成：已同步到服务器。"
+
+# --- 推送到 GitHub ---
+# 工作区有没提交的改动的话，自动 add 全部改动、commit -m "quick fix"，再推送。
+$gitStatus = git status --porcelain
+if ($gitStatus) {
+    Write-Host "工作区有未提交的改动，自动 commit……"
+    git add -A
+    git commit -m "quick fix"
+}
+
+Write-Host "推送到 GitHub…"
+git push origin HEAD
+Write-Host "完成：已推送到 GitHub。"
