@@ -37,7 +37,7 @@ def run_and_capture_diff(
     plan: Plan,
     purchase_book: PurchaseBook,
     summary_book: ShipmentSummaryBook,
-    progress_callback=None,
+    progress_callback=None,  # progress_callback(stage_label, done, total)
 ) -> PreviewResult:
     if plan.has_blocking_errors:
         raise ValueError("这一批发货计划里还有没解决的错误，不能写入")
@@ -76,7 +76,16 @@ def run_and_capture_diff(
             for r in summary_book.pending_rows(*key):
                 summary_before.append(_snapshot_summary(r))
 
-    changes = apply_plan(plan, purchase_book, summary_book, progress_callback=progress_callback)
+    changes = apply_plan(
+        plan,
+        purchase_book,
+        summary_book,
+        progress_callback=(
+            (lambda done, total: progress_callback("正在写入变化", done, total))
+            if progress_callback is not None
+            else None
+        ),
+    )
 
     # 表头要在 apply_plan 跑完之后才取——apply_plan 可能会往采购汇总表插一个新的日期列，
     # 插入前取的表头列表里不会有这一列，写进去的量就会从预览里彻底消失（前后都不显示，
@@ -96,7 +105,8 @@ def run_and_capture_diff(
     c_order = summary_book.col["采购单号"]
     c_model = summary_book.col["型号"]
     c_ship = summary_book.col["发货时间"]
-    for change in changes:
+    total_changes = len(changes)
+    for done, change in enumerate(changes, start=1):
         for r in range(summary_book.header_row + 1, summary_book.ws.max_row + 1):
             if r in seen_after_rows:
                 continue
@@ -118,6 +128,8 @@ def run_and_capture_diff(
             ):
                 seen_after_rows.add(r)
                 summary_after.append(_snapshot_summary(r))
+        if progress_callback is not None:
+            progress_callback("正在生成预览对比", done, total_changes)
 
     return PreviewResult(
         purchase=DiffTable(headers=purchase_headers, before_rows=purchase_before, after_rows=purchase_after),

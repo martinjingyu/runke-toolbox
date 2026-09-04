@@ -82,7 +82,7 @@ class AllocationOutcome:
 
 
 class PurchaseBook:
-    def __init__(self, ws: Worksheet):
+    def __init__(self, ws: Worksheet, progress_callback=None):
         self.ws = ws
         self.header_row = find_header_row(ws, FIXED_HEADERS, max_scan_rows=5)
         self.sub_header_row = self.header_row + 1
@@ -102,15 +102,19 @@ class PurchaseBook:
 
         self.rows: list[PurchaseRow] = []
         self.by_model: dict[str, list[PurchaseRow]] = {}
-        self._load_rows()
+        self._load_rows(progress_callback)
 
     # ---- 读取 ----
 
-    def _load_rows(self) -> None:
+    def _load_rows(self, progress_callback=None) -> None:
         self.rows.clear()
         self.by_model.clear()
         last_row = self.ws.max_row
-        for r in range(self.header_row + 2, last_row + 1):
+        start_row = self.header_row + 2
+        total = max(last_row - start_row + 1, 0)
+        for done, r in enumerate(range(start_row, last_row + 1), start=1):
+            if progress_callback is not None and (done % 200 == 0 or done == total):
+                progress_callback(done, total)
             model = self.ws.cell(row=r, column=self.model_col).value
             if model is None or not str(model).strip():
                 continue

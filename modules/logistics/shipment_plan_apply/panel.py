@@ -58,9 +58,9 @@ _SETTINGS_KEY_PURCHASE = "shipment_plan_apply/purchase_path"
 _SETTINGS_KEY_SUMMARY = "shipment_plan_apply/summary_path"
 
 
-def _next_tuesday(today: dt.date | None = None) -> dt.date:
+def _next_wednesday(today: dt.date | None = None) -> dt.date:
     today = today or dt.date.today()
-    days_ahead = (1 - today.weekday()) % 7  # Monday=0 ... Tuesday=1
+    days_ahead = (2 - today.weekday()) % 7  # Monday=0 ... Wednesday=2
     return today + dt.timedelta(days=days_ahead)
 
 
@@ -102,7 +102,8 @@ class _PlanFileEntry:
 class _PreviewWorker(QThread):
     succeeded = Signal(object)  # (plan, result_or_None, purchase_wb, summary_wb, purchase_book, summary_book)
     failed = Signal(str)
-    progress = Signal(int, int)  # done, total（分摊记录数——真正耗时的插入行操作按这个报进度）
+    stage = Signal(str)  # 只报"现在在做什么"，用在算不出总数/瞬间就完事的步骤（读文件、解析、校验）
+    progress = Signal(str, int, int)  # 阶段名, done, total——用在真的耗时、数得出总数的步骤
 
     def __init__(
         self,
@@ -121,11 +122,13 @@ class _PreviewWorker(QThread):
 
     def run(self):
         try:
+            self.stage.emit("正在读取在售产品信息总表…")
             lookup = load_product_lookup(Path(self._product_path))
 
             all_lines: list[PlanLine] = []
             parse_errors: list[str] = []
             for path, sheet_name, template_type in self._plan_files:
+                self.stage.emit(f"正在解析「{Path(path).name}」…")
                 parsed = parse_shipment_plan(Path(path), sheet_name, template_type)
                 file_label = Path(path).name
                 for line in parsed.lines:
@@ -133,11 +136,20 @@ class _PreviewWorker(QThread):
                 all_lines.extend(parsed.lines)
                 parse_errors.extend(f"[{file_label}] {e}" for e in parsed.errors)
 
+            self.stage.emit("正在加载采购订单汇总表…")
             purchase_wb = openpyxl.load_workbook(self._purchase_path, data_only=False)
-            purchase_book = PurchaseBook(purchase_wb.active)
+            purchase_book = PurchaseBook(
+                purchase_wb.active,
+                progress_callback=lambda done, total: self.progress.emit(
+                    "正在加载采购订单汇总表", done, total
+                ),
+            )
+
+            self.stage.emit("正在加载发货计划汇总表…")
             summary_wb = openpyxl.load_workbook(self._summary_path, data_only=False)
             summary_book = ShipmentSummaryBook(summary_wb.active)
 
+            self.stage.emit("正在校验每一条分摊…")
             plan = build_plan(all_lines, parse_errors, lookup, purchase_book, self._ship_date)
 
             if plan.has_blocking_errors:
@@ -148,7 +160,7 @@ class _PreviewWorker(QThread):
                 plan,
                 purchase_book,
                 summary_book,
-                progress_callback=lambda done, total: self.progress.emit(done, total),
+                progress_callback=lambda stage, done, total: self.progress.emit(stage, done, total),
             )
             self.succeeded.emit((plan, result, purchase_wb, summary_wb, purchase_book, summary_book))
         except Exception as exc:
@@ -228,7 +240,7 @@ class ShipmentPlanApplyPanel(QWidget):
         date_row.addWidget(QLabel("这次发货日期（采购汇总表写进这一列；发货计划汇总表的发货时间也用这个）"))
         self._date_edit = QDateEdit()
         self._date_edit.setCalendarPopup(True)
-        default_date = _next_tuesday()
+        default_date = _next_wednesday()
         self._date_edit.setDate(QDate(default_date.year, default_date.month, default_date.day))
         date_row.addWidget(self._date_edit)
         date_row.addStretch(1)
@@ -371,16 +383,22 @@ class ShipmentPlanApplyPanel(QWidget):
         self._worker = _PreviewWorker(product_path, purchase_path, summary_path, plan_files, ship_date)
         self._worker.succeeded.connect(self._on_preview_succeeded)
         self._worker.failed.connect(self._on_preview_failed)
+        self._worker.stage.connect(self._on_stage)
         self._worker.progress.connect(self._on_progress)
         self._worker.start()
 
-    def _on_progress(self, done: int, total: int):
+    def _on_stage(self, text: str):
+        # 这一步算不出总数（或者本来就很快），先切回忙碌转圈样式，把具体在做什么写进状态栏。
+        self._progress.setRange(0, 0)
+        self._status_label.setText(text)
+
+    def _on_progress(self, stage: str, done: int, total: int):
         if total <= 0:
             return
         if self._progress.maximum() != total:
             self._progress.setRange(0, total)
         self._progress.setValue(done)
-        self._status_label.setText(f"正在写入变化：{done}/{total} 笔分摊……")
+        self._status_label.setText(f"{stage}：{done}/{total}")
 
     def _clear_preview_tables(self):
         self._purchase_diff_group.clear()
