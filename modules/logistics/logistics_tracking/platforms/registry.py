@@ -22,13 +22,13 @@ from .nextsls import NextslsClient
 from .niuku import NiukuClient
 from .ylyn import YlynClient
 from .zhongbao import ZhongbaoClient
+from .kqgyl import KqgylClient
 
 # 物流商代码 -> 中文展示名。代码就是出货跟踪表"物流商"列里的缩写，账号管理界面的下拉框、
 # 预览表格里的"平台尚未接入自动查询"提示都用这份名单，加新物流商在这里加一行就行。
 #
 # ZB 曾经错标成"至美通"(zipto.cn)——跟业务确认过，表格里"物流商"列写 ZB 的实际指"众包"
-# (ops.zbao56.com)，两家是完全不同的公司；凯琦(KQ)还在调研查询接口，暂时还没接进来，继续走
-# 下面的 _not_implemented()。
+# (ops.zbao56.com)，两家是完全不同的公司。
 PLATFORM_LABELS: dict[str, str] = {
     "HDJ": "海德嘉",
     "HX": "恒信",
@@ -155,6 +155,15 @@ def get_last_routes_for_carrier(
         # 借用同一套账号密码 UI 的两个输入框存，见 zhongbao.py 顶部说明。
         def factory(app_key: str, app_token: str) -> ZhongbaoClient:
             return ZhongbaoClient(app_key=app_key, app_token=app_token)
+
+        return _lookup_multi_account(factory, accounts, waybill_numbers)
+
+    if carrier_code == "KQ":
+        if not accounts:
+            return _no_accounts(label, waybill_numbers)
+
+        def factory(username: str, password: str) -> KqgylClient:
+            return KqgylClient(username=username, password=password)
 
         return _lookup_multi_account(factory, accounts, waybill_numbers)
 

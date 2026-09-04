@@ -32,7 +32,7 @@ from pathlib import Path
 
 from openpyxl.worksheet.worksheet import Worksheet
 
-from ..shipment_plan_apply.column_utils import column_index_map, copy_row, require_columns
+from ..shipment_plan_apply.column_utils import column_index_map, copy_row, reindex_formula, require_columns
 from ..shipment_plan_apply.purchase_book import PurchaseBook
 from ..shipment_plan_apply.shipment_summary import BLANK_FIELDS, NEW_STATUS, PENDING_LABEL, ShipmentSummaryBook
 from .order_file import OrderFile, OrderFileError, list_order_files, parse_order_file
@@ -249,6 +249,27 @@ def _as_datetime(value: dt.date | None) -> dt.datetime | None:
     return dt.datetime.combine(value, dt.time()) if value is not None else None
 
 
+def _apply_dim_column(
+    ws: Worksheet, col: int, template_row: int, header_row: int, dest_row: int, fallback: float | None
+) -> None:
+    """长/宽/高这几列，发货计划汇总表里有的行是随箱型自动算的公式，有的是历史手填的写死
+    数字——copy_row() 已经把模板行整行（含公式，自引用部分重指向新行）抄给新行了，模板行
+    本身是公式的话这里什么都不用做，直接覆盖反而会把公式换成写死的历史数字，新行就不会再
+    跟着箱型自动算了。只有模板行这一列不是公式时才需要额外处理：往上找最近一行这一列是
+    公式的，把它的公式抄一份过去（同样重指向新行）；再往上也找不到公式，才退回到从同工厂
+    同型号历史记录里查出来的写死数字。
+    """
+    template_value = ws.cell(row=template_row, column=col).value
+    if isinstance(template_value, str) and template_value.startswith("="):
+        return
+    for r in range(template_row - 1, header_row, -1):
+        v = ws.cell(row=r, column=col).value
+        if isinstance(v, str) and v.startswith("="):
+            _set(ws, dest_row, col, reindex_formula(v, r, dest_row))
+            return
+    _set(ws, dest_row, col, fallback)
+
+
 def _set(ws: Worksheet, row: int, col: int, value) -> None:
     # ws.cell(row, column, value=X) 在 openpyxl 里只有 X 不是 None 才会真的赋值——传 None
     # 等于没传，格子会保留 copy_row() 抄过来的旧值。这里统一走 .value = ，None 也能真的清空。
@@ -264,6 +285,18 @@ def apply_plan(plan: Plan, purchase_ws: Worksheet, summary_ws: Worksheet) -> Non
     require_columns(p_cols, ["序号", "订单号", "采购日期", "交货日期", "供应商名称", "型号", "产品名称", "订单数量", "数量单位"], "采购订单汇总表")
     p_last_row = max((r.row_index for r in purchase_book.rows), default=purchase_book.header_row)
     seq = _next_seq(purchase_ws, purchase_book.header_row, p_cols["序号"], p_last_row)
+
+    # 同一个订单号在采购汇总表里只占一个序号——用 plan.items 里"同订单号的行连在一起"这个
+    # 保证（build_plan 按订单一份一份处理，一个订单的所有型号行紧挨着追加），订单号变了才
+    # 递增序号，行号range最后统一做单元格合并。
+    item_seqs: list[int] = []
+    current_seq = seq - 1
+    prev_order_no: object = object()
+    for item in plan.items:
+        if item.order_no != prev_order_no:
+            current_seq += 1
+            prev_order_no = item.order_no
+        item_seqs.append(current_seq)
 
     summary_book = ShipmentSummaryBook(summary_ws)
     s_cols = column_index_map(summary_ws, summary_book.header_row)
@@ -291,7 +324,13 @@ def apply_plan(plan: Plan, purchase_ws: Worksheet, summary_ws: Worksheet) -> Non
         if p_remark_col:
             _set(purchase_ws, p_row, p_remark_col, None)
 
-        _set(purchase_ws, p_row, p_cols["序号"], str(seq + i).zfill(_SEQ_WIDTH))
+        # 序号只写在同一订单号的第一行，后面几行留空，等下面统一合并单元格——跟纸质表格
+        # 里"同一个订单号只写一次序号、其余行合并"的排版方式一致。
+        is_first_of_order = i == 0 or plan.items[i - 1].order_no != item.order_no
+        if is_first_of_order:
+            _set(purchase_ws, p_row, p_cols["序号"], str(item_seqs[i]).zfill(_SEQ_WIDTH))
+        else:
+            _set(purchase_ws, p_row, p_cols["序号"], None)
         _set(purchase_ws, p_row, p_cols["订单号"], item.order_no)
         _set(purchase_ws, p_row, p_cols["采购日期"], _as_datetime(item.purchase_date))
         _set(purchase_ws, p_row, p_cols["交货日期"], _as_datetime(item.delivery_date))
@@ -315,11 +354,27 @@ def apply_plan(plan: Plan, purchase_ws: Worksheet, summary_ws: Worksheet) -> Non
         _set(summary_ws, s_row, s_cols["产品名称"], item.product_name)
         _set(summary_ws, s_row, s_cols["箱数"], item.boxes)
         _set(summary_ws, s_row, s_cols["箱容"], item.box_capacity)
-        _set(summary_ws, s_row, s_cols["长"], item.length)
-        _set(summary_ws, s_row, s_cols["宽"], item.width)
-        _set(summary_ws, s_row, s_cols["高"], item.height)
+        _apply_dim_column(summary_ws, s_cols["长"], s_template_row, summary_book.header_row, s_row, item.length)
+        _apply_dim_column(summary_ws, s_cols["宽"], s_template_row, summary_book.header_row, s_row, item.width)
+        _apply_dim_column(summary_ws, s_cols["高"], s_template_row, summary_book.header_row, s_row, item.height)
         _set(summary_ws, s_row, s_cols["毛重"], item.gross_weight)
         _set(summary_ws, s_row, s_cols["交货时间"], _as_datetime(item.delivery_date))
         _set(summary_ws, s_row, s_cols["发货时间"], PENDING_LABEL)
         _set(summary_ws, s_row, s_cols["工厂"], item.supplier_code)
         _set(summary_ws, s_row, s_cols["状态"], NEW_STATUS)
+
+    _merge_order_seq_cells(purchase_ws, plan.items, p_cols["序号"], p_last_row)
+
+
+def _merge_order_seq_cells(ws: Worksheet, items: list[PlanItem], seq_col: int, first_new_row: int) -> None:
+    """同一订单号新增的几行连在一起，把它们的「序号」列合并成一个单元格（值已经只写在
+    第一行，其余行留空，交给合并单元格来显示成"同一个序号跨了好几行"）。
+    """
+    run_start = first_new_row + 1
+    for i in range(1, len(items) + 1):
+        row = first_new_row + i
+        is_last = i == len(items) or items[i].order_no != items[i - 1].order_no
+        if is_last:
+            if row > run_start:
+                ws.merge_cells(start_row=run_start, start_column=seq_col, end_row=row, end_column=seq_col)
+            run_start = row + 1

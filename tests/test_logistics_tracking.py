@@ -241,8 +241,8 @@ def test_get_last_routes_for_carrier_without_accounts_reports_reason():
 
 
 def test_get_last_routes_for_carrier_unimplemented_platform():
-    result = get_last_routes_for_carrier("KQ", [("u", "p")], ["KQ0001"])
-    assert "尚未接入自动查询" in result["KQ0001"].error
+    result = get_last_routes_for_carrier("YH", [("u", "p")], ["YH0001"])
+    assert "尚未接入自动查询" in result["YH0001"].error
 
 
 def test_get_last_routes_for_carrier_unknown_code():
@@ -414,3 +414,72 @@ def test_zhongbao_get_last_routes_picks_latest_event_and_reports_failures():
 
     assert result["ZB0003"].found is False
     assert result["ZB0003"].error == "暂无路由信息"
+
+
+# ---- platforms/kqgyl.py ----
+
+
+def test_kqgyl_get_last_routes_paginates_and_picks_track_info(monkeypatch):
+    """凯琦不是按单号查、是分页拉全量列表（跟 ylyn.py/nextsls.py 一路），这里假一个两页的
+    列表验证分页会翻完、以及"有 trackInfo 用 trackInfo，没有就退回 nodeName，都配上
+    trackOperTime 当时间前缀"这几条规则。
+    """
+    from modules.logistics.logistics_tracking.platforms import kqgyl
+
+    monkeypatch.setattr(kqgyl.KqgylClient, "_login", lambda self, username, password: "fake-token")
+    client = kqgyl.KqgylClient("RKDS", "pw")
+
+    page1 = {
+        "code": 200,
+        "data": {
+            "totalCount": 2,
+            "data": [
+                {
+                    "waybillNumber": "FBA0001",
+                    "trackInfo": "2026-09-03 已签收",
+                    "trackOperTime": "2026-09-03 15:01:28",
+                    "nodeName": "已入仓",
+                },
+            ],
+        },
+    }
+    page2 = {
+        "code": 200,
+        "data": {
+            "totalCount": 2,
+            "data": [
+                {
+                    "waybillNumber": "FBA0002",
+                    "trackInfo": None,
+                    "trackOperTime": "2026-09-04 18:20:39",
+                    "nodeName": "已预报",
+                },
+            ],
+        },
+    }
+    pages = iter([page1, page2])
+    monkeypatch.setattr(
+        client.session, "post", lambda *a, **k: _FakeKqgylResponse(next(pages))
+    )
+
+    result = client.get_last_routes(["FBA0001", "FBA0002", "NOT_EXIST"])
+
+    assert result["FBA0001"].found is True
+    assert result["FBA0001"].last_route == "2026-09-03 15:01:28 2026-09-03 已签收"
+
+    assert result["FBA0002"].found is True
+    assert result["FBA0002"].last_route == "2026-09-04 18:20:39 已预报"  # 没有 trackInfo，退回节点名
+
+    assert result["NOT_EXIST"].found is False
+    assert result["NOT_EXIST"].error == "未找到该运单"
+
+
+class _FakeKqgylResponse:
+    def __init__(self, data: dict):
+        self._data = data
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._data

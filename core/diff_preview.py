@@ -53,6 +53,13 @@ REMOVED_COLOR = QColor("#F8CBAD")  # 变化前
 ADDED_COLOR = QColor("#C6E0B4")  # 变化后
 
 ROW_INDEX_KEY = "__row__"
+# 调用方明知道"哪条变化前行对应哪几条变化后行"（比如一条 change 精确来自哪一行"待定"库存）时，
+# 可以直接在 before_rows/after_rows 的每个 dict 里塞这个 key（值是组号，同一组的行用同一个数字），
+# fill() 会优先按这个分组，不再靠 key_fields 做笛卡尔式关联——同一个 key_fields 组合下有好几条
+# before 行时（比如同一采购单号+型号有好几行"待定"），后者会把所有变化后行错误地重复关联给
+# 每一条 before 行。没有塞这个 key 的表（比如 key_fields 本身已经能唯一定位一行）沿用旧的按
+# key_fields 匹配的方式。
+GROUP_KEY = "__group__"
 
 _MAX_VISIBLE_ROWS = 30
 _GROUP_ROLE = Qt.ItemDataRole.UserRole  # 这一行属于第几组（一组=一条变化前+它对应的几条变化后）
@@ -270,13 +277,27 @@ class DiffPreviewGroup(QGroupBox):
         def key_of(row: dict) -> tuple:
             return tuple(row.get(f) for f in key_fields)
 
-        after_by_key: dict[tuple, list[dict]] = {}
-        for row in diff.after_rows:
-            after_by_key.setdefault(key_of(row), []).append(row)
+        has_explicit_groups = diff.before_rows and all(
+            GROUP_KEY in r for r in diff.before_rows
+        ) and all(GROUP_KEY in r for r in diff.after_rows)
 
-        groups: list[tuple[dict, list[dict]]] = [
-            (before_row, after_by_key.get(key_of(before_row), [])) for before_row in diff.before_rows
-        ]
+        if has_explicit_groups:
+            # 精确分组：一条 before 行只会配上真正由它产生的那几条 after 行，不会跟同 key_fields
+            # 的其他 before 行抢/重复关联。
+            after_by_group: dict[object, list[dict]] = {}
+            for row in diff.after_rows:
+                after_by_group.setdefault(row[GROUP_KEY], []).append(row)
+            groups: list[tuple[dict, list[dict]]] = [
+                (before_row, after_by_group.get(before_row[GROUP_KEY], [])) for before_row in diff.before_rows
+            ]
+        else:
+            after_by_key: dict[tuple, list[dict]] = {}
+            for row in diff.after_rows:
+                after_by_key.setdefault(key_of(row), []).append(row)
+
+            groups = [
+                (before_row, after_by_key.get(key_of(before_row), [])) for before_row in diff.before_rows
+            ]
 
         changed_columns: set = set()
         for before_row, after_rows in groups:

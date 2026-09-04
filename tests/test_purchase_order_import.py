@@ -321,7 +321,12 @@ def test_apply_plan_appends_rows_to_both_sheets_with_seq_numbering(tmp_path, tab
     assert p_ws.cell(row=5, column=9).value == 90
     assert p_ws.cell(row=5, column=10).value == "pcs"
     assert p_ws.cell(row=5, column=6).value is None  # 店铺列模板行本来就是空的，抄过来还是空
-    assert p_ws.cell(row=6, column=1).value == "003"
+    # 同一个订单号（GH-2609001）下的两个型号共用一个序号：值只写在第 5 行，第 6 行跟它合并
+    # （合并单元格里非左上角的格子，openpyxl 读出来的 value 固定是 None，不能拿来断言）
+    assert any(
+        rng.min_row == 5 and rng.max_row == 6 and rng.min_col == 1 and rng.max_col == 1
+        for rng in p_ws.merged_cells.ranges
+    )
     # 未出货数量是公式，整行复制时应该按"自引用这一行"重新指向新行号（原来 =I4，新行是 =I5）
     assert p_ws.cell(row=5, column=12).value == "=I5"
     # 型号格子的底色格式也应该跟着抄过来
@@ -347,8 +352,48 @@ def test_apply_plan_appends_rows_to_both_sheets_with_seq_numbering(tmp_path, tab
     # 产品名称格子的底色格式也应该跟着抄过来
     assert s_ws.cell(row=7, column=4).fill.fgColor.rgb == s_ws.cell(row=6, column=4).fill.fgColor.rgb
 
-    # 第二个型号是全新品，没有历史记录，长宽高/箱容/箱数都留空；但公式列还是照样抄公式
-    assert s_ws.cell(row=8, column=2).value == "TD-NEW"
-    assert s_ws.cell(row=8, column=5).value is None
-    assert s_ws.cell(row=8, column=6).value is None
-    assert s_ws.cell(row=8, column=3).value == "=+B8"
+
+def test_apply_plan_preserves_dim_formulas_in_shipment_summary(tmp_path):
+    # 发货计划汇总表的最后一行（模板行）「长/宽/高」是公式（跟着箱容自动算），不是写死数字——
+    # 新增行应该保留这个公式（自引用部分重指向新行），不能被写死的历史数字覆盖掉。
+    purchase_path = tmp_path / "purchase.xlsx"
+    summary_path = tmp_path / "summary.xlsx"
+    _write_purchase_summary(purchase_path)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "发货计划"
+    for _ in range(4):
+        ws.append([None] * 27)
+    ws.append([
+        "采购单号", "型号", "标签", "产品名称", "箱数", "箱容", "数量", "长", "宽", "高", "毛重",
+        "CBM", "总材重", "总实重", "仓库", "FBA ID", "追踪编号", "ZD", "编号", "备注", "交货时间",
+        "发货时间", "工厂", "DP", "货代", "出货单号", "状态", "so",
+    ])
+    ws.append([
+        "GH-2501009", "TD-RZ-419", "=+B6", "简约花瓶灰色树脂台灯", 60, 3, "=E6*F6",
+        "=F6*10", "=F6*20", "=F6*30",
+        13.6, None, None, None, "US", "FBA1", "TRACK1", "CA1", None, None, dt.datetime(2025, 3, 17),
+        dt.datetime(2026, 1, 7), "GH", None, "KQ", "SK1", "已发货", None,
+    ])
+    wb.save(summary_path)
+
+    order_folder = tmp_path / "orders"
+    order_folder.mkdir()
+    _write_order_file(
+        order_folder / "order1.xlsx",
+        order_no="GH-2609001",
+        supplier="广东GH工厂",
+        rows=[("TD-RZ-419", "简约花瓶灰色树脂台灯", 90, dt.datetime(2026, 10, 1))],
+    )
+
+    purchase_wb = openpyxl.load_workbook(purchase_path)
+    summary_wb = openpyxl.load_workbook(summary_path)
+    plan = build_plan(order_folder, purchase_wb.active, summary_wb.active, {"广东GH工厂": "GH"})
+    apply_plan(plan, purchase_wb.active, summary_wb.active)
+
+    s_ws = summary_wb.active
+    # 新行接在第 7 行，长/宽/高应该还是公式，自引用的 F6 改成了 F7
+    assert s_ws.cell(row=7, column=8).value == "=F7*10"
+    assert s_ws.cell(row=7, column=9).value == "=F7*20"
+    assert s_ws.cell(row=7, column=10).value == "=F7*30"

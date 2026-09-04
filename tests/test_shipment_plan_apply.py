@@ -5,6 +5,7 @@ import openpyxl
 import pytest
 from openpyxl.styles import Border, PatternFill, Side
 
+from core.diff_preview import GROUP_KEY
 from modules.logistics.shipment_plan_apply.column_utils import resolve_cell_value
 from modules.logistics.shipment_plan_apply.diff import run_and_capture_diff
 from modules.logistics.shipment_plan_apply.planner import build_plan, apply_plan
@@ -587,6 +588,110 @@ def test_planner_and_diff_end_to_end(tmp_path):
     assert result.purchase.after_rows[0]["未出货数量"] == 50
     assert len(result.summary.before_rows) == 1
     assert len(result.summary.after_rows) == 2  # 部分发货：新行 + 剩余待定行
+
+
+def test_diff_preview_does_not_duplicate_after_rows_across_sibling_pending_rows(tmp_path):
+    # 回归测试：同一个采购单号+型号同时有两行"待定"，一笔出货正好吃掉第一行全部、又部分
+    # 吃掉第二行——预览应该是"第一行删除 + 它对应的 1 条新增"、"第二行删除 + 它对应的 2 条
+    # 新增"，而不是把这次操作产生的全部 3 条新增行重复挂在每一个被删除的原始行下面。
+    product_path = tmp_path / "product.xlsx"
+    _write_product_info(product_path, [("AMZ-1", "RK-1", "M1")])
+    lookup = load_product_lookup(product_path)
+
+    purchase_path = tmp_path / "purchase.xlsx"
+    _write_purchase_book(purchase_path)
+    purchase_wb = openpyxl.load_workbook(purchase_path, data_only=False)
+    purchase_book = PurchaseBook(purchase_wb.active)
+
+    summary_path = tmp_path / "summary.xlsx"
+    summary_setup_wb = openpyxl.Workbook()
+    summary_ws = summary_setup_wb.active
+    headers = [
+        "采购单号", "型号", "箱数", "箱容", "数量", "ZD", "发货时间", "状态",
+        "仓库", "FBA ID", "追踪编号", "备注", "货代", "出货单号", "so", "编号",
+    ]
+    summary_ws.append(headers)
+    # 两行待定：一行 10 个（会被整行转正），一行 20 个（会被扣 15，剩 5 还待定）
+    summary_ws.append(["PO-EARLY", "M1", 10, 1, 10, None, "待定", "未发货", None, None, None, None, None, None, None, None])
+    summary_ws.append(["PO-EARLY", "M1", 20, 1, 20, None, "待定", "未发货", None, None, None, None, None, None, None, None])
+    summary_setup_wb.save(summary_path)
+    summary_wb = openpyxl.load_workbook(summary_path)
+    summary_book = ShipmentSummaryBook(summary_wb.active)
+
+    from modules.logistics.shipment_plan_apply.shipment_templates import PlanLine
+
+    lines = [
+        PlanLine(zd="ZD1", sku_kind="RK", sku="RK-1", quantity=25, destination_label="ZD1", source_row=2)
+    ]
+    plan = build_plan(lines, [], lookup, purchase_book, dt.date(2026, 9, 1))
+    assert not plan.has_blocking_errors
+
+    result = run_and_capture_diff(plan, purchase_book, summary_book)
+
+    assert len(result.summary.before_rows) == 2
+    assert len(result.summary.after_rows) == 3  # 1 条整行转正 + (1 条新发货行 + 1 条剩余待定行)
+
+    before_groups = [row[GROUP_KEY] for row in result.summary.before_rows]
+    assert len(set(before_groups)) == 2  # 两条 before 行分属两个不同的组，不能被合并
+
+    after_by_group: dict = {}
+    for row in result.summary.after_rows:
+        after_by_group.setdefault(row[GROUP_KEY], []).append(row)
+
+    # 第一行（原 10 个，整行转正）只对应 1 条新增
+    group_of_10 = next(row[GROUP_KEY] for row in result.summary.before_rows if row["数量"] == 10)
+    assert len(after_by_group[group_of_10]) == 1
+
+    # 第二行（原 20 个，部分扣减）对应 2 条新增：新发货的 15 + 剩余待定的 5
+    group_of_20 = next(row[GROUP_KEY] for row in result.summary.before_rows if row["数量"] == 20)
+    assert len(after_by_group[group_of_20]) == 2
+    assert {row["数量"] for row in after_by_group[group_of_20]} == {15, 5}
+
+
+def test_diff_preview_group_tracks_leftover_row_consumed_by_a_later_change(tmp_path):
+    # 回归测试：同一分组的"剩余待定行"如果之后又被另一个 item 继续扣（这一批发货计划里有
+    # 两条记录都指向同一个采购单号+型号），预览不应该还显示一条早就不存在了的"剩余待定行"，
+    # 应该显示两条真正落地的发货记录。
+    product_path = tmp_path / "product.xlsx"
+    _write_product_info(product_path, [("AMZ-1", "RK-1", "M1")])
+    lookup = load_product_lookup(product_path)
+
+    purchase_path = tmp_path / "purchase.xlsx"
+    _write_purchase_book(purchase_path)
+    purchase_wb = openpyxl.load_workbook(purchase_path, data_only=False)
+    purchase_book = PurchaseBook(purchase_wb.active)
+
+    summary_path = tmp_path / "summary.xlsx"
+    summary_setup_wb = openpyxl.Workbook()
+    summary_ws = summary_setup_wb.active
+    headers = [
+        "采购单号", "型号", "箱数", "箱容", "数量", "ZD", "发货时间", "状态",
+        "仓库", "FBA ID", "追踪编号", "备注", "货代", "出货单号", "so", "编号",
+    ]
+    summary_ws.append(headers)
+    summary_ws.append(["PO-EARLY", "M1", 30, 1, 30, None, "待定", "未发货", None, None, None, None, None, None, None, None])
+    summary_setup_wb.save(summary_path)
+    summary_wb = openpyxl.load_workbook(summary_path)
+    summary_book = ShipmentSummaryBook(summary_wb.active)
+
+    from modules.logistics.shipment_plan_apply.shipment_templates import PlanLine
+
+    # 两条计划行都指向同一个采购单号+型号：第一条扣 10（剩 20 还待定），第二条再扣 20（正好扣完）
+    lines = [
+        PlanLine(zd="ZD1", sku_kind="RK", sku="RK-1", quantity=10, destination_label="ZD1", source_row=2),
+        PlanLine(zd="ZD1", sku_kind="RK", sku="RK-1", quantity=20, destination_label="ZD1", source_row=3),
+    ]
+    plan = build_plan(lines, [], lookup, purchase_book, dt.date(2026, 9, 1))
+    assert not plan.has_blocking_errors
+
+    result = run_and_capture_diff(plan, purchase_book, summary_book)
+
+    assert len(result.summary.before_rows) == 1
+    # 应该是 2 条发货记录（10 个 + 20 个），不应该还多一条"剩余 20 待定"（那一行早就被第二条
+    # change 继续扣完了，不再存在）
+    assert len(result.summary.after_rows) == 2
+    assert {row["数量"] for row in result.summary.after_rows} == {10, 20}
+    assert all(row[GROUP_KEY] == result.summary.before_rows[0][GROUP_KEY] for row in result.summary.after_rows)
 
 
 def test_planner_blocks_whole_batch_on_shortfall(tmp_path):

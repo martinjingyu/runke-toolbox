@@ -100,6 +100,30 @@ class ShipmentSummaryBook:
         self.header_row = find_header_row(ws, REQUIRED_HEADERS, max_scan_rows=10)
         cols = column_index_map(ws, self.header_row)
         self.col = require_columns(cols, REQUIRED_HEADERS, "发货计划汇总表")
+        # 只有"标签"、CBM、总材重等少数几列是公式，剩下的采购单号/型号/箱数这些都是普通值——
+        # _reindex_shifted_rows 每插入一行都要把插入点以下所有行的公式引用改一遍，一批发货
+        # 涉及几十上百次插入、表又有几万行的话，逐列扫一遍很费时间（这是这个工具偶尔跑到卡死
+        # 的原因之一）。这里在加载的时候把"哪些列实际出现过公式"扫一遍记下来，后面每次插入只
+        # 用检查这几列，不用检查整行——只在加载时做一次全表扫描，之后插入再多次也不会重复扫，
+        # 新插入的行是从既有行整行复制来的（见 _copy_row_with_reindex），不会凭空冒出一个
+        # 之前从没出现过公式的新公式列。
+        self._formula_columns = self._scan_formula_columns()
+        # openpyxl 的 ws.max_row / ws.max_column 不是缓存属性——每次访问都要把底层存储重新扫一遍
+        # 找最大行号/列号（在几万行的表上，一次访问就是几万次内部循环）。这张表在这个 book 实例
+        # 的生命周期里只会往下插行（insert_rows），不会插列、也不会有别的代码改动行数，所以这里
+        # 缓存一份、自己维护，每 insert_rows 一次就 +1，不用每次都问 openpyxl 要重新扫一遍——
+        # 这是 apply_shipment 反复调用（一批发货几十上百次分摊）时最大的隐藏耗时来源之一。
+        self._max_row = ws.max_row
+        self._max_column = ws.max_column
+
+    def _scan_formula_columns(self) -> list[int]:
+        formula_columns: set[int] = set()
+        for row in self.ws.iter_rows(min_row=self.header_row + 1):
+            for cell in row:
+                value = cell.value
+                if isinstance(value, str) and value.startswith("="):
+                    formula_columns.add(cell.column)
+        return sorted(formula_columns)
 
     def pending_rows(self, order_no: str, model: str) -> list[int]:
         """按行顺序返回这个采购单号+型号名下所有"发货时间=待定"的行号（可能不止一个）。"""
@@ -108,7 +132,7 @@ class ShipmentSummaryBook:
         c_ship = self.col["发货时间"]
         return [
             r
-            for r in range(self.header_row + 1, self.ws.max_row + 1)
+            for r in range(self.header_row + 1, self._max_row + 1)
             if (
                 self.ws.cell(row=r, column=c_order).value == order_no
                 and self.ws.cell(row=r, column=c_model).value == model
@@ -195,6 +219,7 @@ class ShipmentSummaryBook:
             new_row = pending_row
             template_row = pending_row + 1  # 待定行内容因为插入整体下移了一行
             self.ws.insert_rows(new_row)
+            self._max_row += 1  # 见 __init__ 里 self._max_row 的说明，插一行就跟着 +1，不重新扫表
             # insert_rows 只搬单元格的值，不会像 Excel 那样把公式里"指向自己这一行"的引用
             # 跟着往下调整——插入点以下所有行（不只是待定行）都要先把这类公式修好，不然
             # 插入点以下所有行的 CBM/总材重/总实重/DP 等公式都会读到错位的旧数据。
@@ -252,11 +277,11 @@ class ShipmentSummaryBook:
         # inserted_at 这一行是刚插入的空行；它往下的每一行内容都往下搬了一行。这张表里的公式
         # 既有"自己引用自己这一行"的（比如"标签"=+B405），也有跨很多行的区间引用（比如最底下
         # 的合计行 =SUBTOTAL(9,E6:E27947)）——只要公式里出现的行号 >= 插入点，就该 +1，
-        # 不管是哪一种。
-        max_col = self.ws.max_column
-        max_row = self.ws.max_row
-        for row in range(inserted_at + 1, max_row + 1):
-            for c in range(1, max_col + 1):
+        # 不管是哪一种。只挑 __init__ 时扫出来的"确实出现过公式"的那几列检查，不用把这张表
+        # 每一列都过一遍——insert_above 一批发货可能触发几十上百次插入，每次都把插入点以下
+        # 所有行 x 所有列全扫一遍的话，非公式的那些数据列（采购单号/型号/箱数……）纯粹是白扫。
+        for row in range(inserted_at + 1, self._max_row + 1):
+            for c in self._formula_columns:
                 cell = self.ws.cell(row=row, column=c)
                 value = cell.value
                 if isinstance(value, str) and value.startswith("="):
@@ -285,8 +310,7 @@ class ShipmentSummaryBook:
         # 整行复制：格式（字体/填充/边框/对齐/数字格式）也要一起抄，不然新插入的行会是一整行
         # 没有任何样式的空白格子，跟旁边的行观感完全不一样——insert_rows 新建出来的空行本来
         # 就是没有任何格式的。
-        max_col = self.ws.max_column
-        for c in range(1, max_col + 1):
+        for c in range(1, self._max_column + 1):
             src_cell = self.ws.cell(row=src_row, column=c)
             dest_cell = self.ws.cell(row=dest_row, column=c)
             value = src_cell.value
