@@ -10,6 +10,10 @@ platforms/ 下（见 platforms/registry.py）。
 "是否有更新"这一列的判断：新查到的"最后流水"如果跟这一行原来就有的"最后流水"不一样（包括
 原来是空的情况），才算"有更新"；查询本身失败的话，直接把失败原因写进去（未接入自动查询/
 还没配账号/未找到该运单/暂无路由信息等），不是留空，方便一眼看出是哪个环节卡住的。
+
+查到路由的两种情况都带上查询当天的日期（方便看出这是哪天查的、是不是最近才更新），格式
+固定是"x.x有更新"/"x.x已查，无更新"（月.日，不补零）——不写成笼统的"无更新"，那样看不出
+这是什么时候查的、是不是已经好几天没人跟进了。
 """
 from __future__ import annotations
 
@@ -17,6 +21,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import copy
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import openpyxl
@@ -72,6 +77,11 @@ def _text(value) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _today_label() -> str:
+    d = date.today()
+    return f"{d.month}.{d.day}"
 
 
 @dataclass
@@ -206,7 +216,12 @@ class TrackingSheet:
                     )
                 )
             elif res.last_route:
-                has_update = "有更新" if _text(old_last_route) != _text(res.last_route) else "无更新"
+                today = _today_label()
+                has_update = (
+                    f"{today}有更新"
+                    if _text(old_last_route) != _text(res.last_route)
+                    else f"{today}已查，无更新"
+                )
                 previews.append(
                     TrackingPreviewRow(
                         row=row.row, carrier=row.carrier, waybill=row.waybill, status=row.status,

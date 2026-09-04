@@ -52,10 +52,20 @@ def _default_sheet_index(sheet_names: list[str]) -> int:
 
 
 def _build_diff_table(previews: list[TrackingPreviewRow]) -> DiffTable:
+    """同一个运单号经常在表里占好几行(比如一票货拆了好几个 SKU，每个 SKU 一行、但运单号都
+    一样)——这些行查到的"最后流水"/"是否有更新"必然完全相同，预览表格里没必要重复显示，
+    只留第一次出现的那一行(按(物流商, 运单号)去重)；apply_preview() 用的还是完整的
+    previews，每一行原样写回，不受这里"只显示一次"的影响。
+    """
     headers = ["行号", "物流商", "运单号", "货件状态", "最后流水", "是否有更新"]
+    seen: set[tuple[str, str]] = set()
     before_rows = []
     after_rows = []
     for p in previews:
+        key = (p.carrier, p.waybill)
+        if key in seen:
+            continue
+        seen.add(key)
         before_rows.append({
             "行号": p.row, "物流商": p.carrier, "运单号": p.waybill, "货件状态": p.status,
             "最后流水": p.old_last_route, "是否有更新": p.old_has_update,
@@ -383,7 +393,7 @@ class LogisticsTrackingPanel(QWidget):
         self._sheet = sheet
         self._previews = previews
 
-        updated = sum(1 for p in previews if p.new_has_update == "有更新")
+        updated = sum(1 for p in previews if p.new_has_update.endswith("有更新"))
         failed = sum(1 for p in previews if p.new_last_route is None)
         self._status_label.setText(
             f"预览完成，共扫到 {len(previews)} 行需要处理，其中 {updated} 行有更新、"

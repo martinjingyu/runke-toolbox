@@ -13,12 +13,14 @@ findLogisticsTrack 返回的是这个运单从下单到签收的完整事件列�
 查不到的运单号，接口返回 {"code":"order_not_exist","message":"订单不存在","success":false}
 (不是 HTTP 错误状态码，200 也会带这个 body)。
 
-跟纽酷不一样的是这个接口是逐个运单号查的(没有批量导出)，get_last_routes() 因此按运单号数量
-线性发请求——真的要查的运单号很多的话会比较慢，但目前实测账号名下的量还不大，暂时不做额外的
-并发优化，等以后量级明显增长了再看要不要在这一个 client 内部也拆线程。
+这个接口是逐个运单号查的(没有批量导出)，get_last_routes() 因此用 ThreadPoolExecutor 开
+MAX_WORKERS 个线程并发发请求，不是排队一个一个等——量一大能明显提速。requests.Session
+底层连接池本身是线程安全的，多线程共用同一个 session 没问题；并发数先保守定成 5，纽酷那边
+有没有限流不确定，别把账号搞出临时封禁。
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import requests
@@ -26,6 +28,7 @@ import requests
 from .base import RouteResult
 
 BASE_URL = "https://api.usniuku.com"
+MAX_WORKERS = 5
 
 
 class NiukuClient:
@@ -62,18 +65,23 @@ class NiukuClient:
 
     def get_last_routes(self, waybill_numbers: list[str]) -> dict[str, RouteResult]:
         results: dict[str, RouteResult] = {}
-        for wb in waybill_numbers:
-            events = self._find_logistics_track(wb)
-            if not events:
-                results[wb] = RouteResult(waybill=wb, error="未找到该运单")
-                continue
-            latest = max(events, key=_parse_date)
-            results[wb] = RouteResult(
-                waybill=wb,
-                found=True,
-                last_route=f"{latest.get('date', '')} {latest.get('content', '')}".strip(),
-                raw_events=events,
-            )
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_waybill = {
+                executor.submit(self._find_logistics_track, wb): wb for wb in waybill_numbers
+            }
+            for future in future_to_waybill:
+                wb = future_to_waybill[future]
+                events = future.result()
+                if not events:
+                    results[wb] = RouteResult(waybill=wb, error="未找到该运单")
+                    continue
+                latest = max(events, key=_parse_date)
+                results[wb] = RouteResult(
+                    waybill=wb,
+                    found=True,
+                    last_route=f"{latest.get('date', '')} {latest.get('content', '')}".strip(),
+                    raw_events=events,
+                )
         return results
 
 

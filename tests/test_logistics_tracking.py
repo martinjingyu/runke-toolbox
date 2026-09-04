@@ -129,9 +129,10 @@ def test_build_preview_groups_by_carrier_and_computes_has_update(monkeypatch):
         progress_callback=lambda done, total: progress_calls.append((done, total)),
     )
 
+    today = tracking_pipeline._today_label()
     by_waybill = {p.waybill: p for p in previews}
-    assert by_waybill["HDJ0001"].new_has_update == "无更新"
-    assert by_waybill["HDJ0002"].new_has_update == "有更新"
+    assert by_waybill["HDJ0001"].new_has_update == f"{today}已查，无更新"
+    assert by_waybill["HDJ0002"].new_has_update == f"{today}有更新"
     assert by_waybill["NK0001"].new_last_route is None
     assert by_waybill["NK0001"].new_has_update == "未找到该运单"
 

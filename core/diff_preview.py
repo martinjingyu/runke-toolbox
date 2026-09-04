@@ -388,10 +388,10 @@ class DiffPreviewGroup(QGroupBox):
         self._recompute_visibility()
 
     def _recompute_visibility(self) -> None:
-        # 按组过滤：一组（一条变化前 + 它对应的几条变化后）里，只要有一行在每一个开了筛选的列上
-        # 都命中，这一组就整体保留——不会出现"变化前留着、对应的变化后被筛没了"这种看不完整的
-        # 情况（变化前后同一列的值本来就可能不一样，这正是要对比的东西，所以不能要求每一行
-        # 自己都满足所有筛选条件，而是整组只要有代表命中就行）。
+        # 按组过滤：筛选条件按"变化后"的值来判断（用户在意的是改完之后是什么样，不是改之前），
+        # 一组（一条变化前 + 它对应的几条变化后）只要有一条"变化后"在每个开了筛选的列上都命中，
+        # 这一组就整体保留、连同它的"变化前"一起显示，保持对比完整。极少数没有对应"变化后"的组
+        # （理论上不应该出现，但保底别把这种组直接筛没）退回用"变化前"的值判断。
         table = self._table
         row_count = table.rowCount()
 
@@ -408,9 +408,14 @@ class DiffPreviewGroup(QGroupBox):
 
         visible_groups: set = set()
         for group_id, rows in groups.items():
+            after_rows = [r for r in rows if (table.item(r, 0).text() if table.item(r, 0) else "").startswith("＋")]
+            candidate_rows = after_rows or rows
             ok = True
             for col, allowed in self._column_filters.items():
-                if not any((table.item(r, col).text() if table.item(r, col) else "") in allowed for r in rows):
+                if not any(
+                    (table.item(r, col).text() if table.item(r, col) else "") in allowed
+                    for r in candidate_rows
+                ):
                     ok = False
                     break
             if ok:
