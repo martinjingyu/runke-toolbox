@@ -194,6 +194,17 @@ backup_path = backup_file(target_path)   # 在原文件旁边生成带时间戳�
 
 调用方要保证：备份失败就整个中止写入，不能带着"这次没备份成"的状态继续写。
 
+### 需要用户在界面里输入、保存的机密（账号密码之类）——用 QSettings，不要用 `core/storage`
+
+`modules/logistics/logistics_tracking` 是第一个"要在界面里管理登录账号密码"的工具（查货代平台
+接口要登录）。这类数据跟"业务数据表格"（`core/storage` 那套、以后可能对接 NAS 共享给全组）性质
+完全不同——账号密码是纯本机机密，绝对不能被以后接的 NAS 后端顺手同步出去给别人。所以走跟
+"记住上次选过的文件路径"一样的 `QSettings`（`shipment_plan_apply/panel.py` 已经在用），账号密码
+另外序列化成 JSON 文本存进一个 key，不用 QSettings 原生数组接口（各平台行为细节不完全一致）。
+参考 `logistics_tracking/credential_store.py`（`CredentialStore`，支持一个平台配多个账号、
+按顺序 fallback、可测试注入 `QSettings(path, IniFormat)`）——以后别的工具要存"这台电脑专属的
+机密"，直接照这个模式抄，不要塞进 `core/storage`、也不要提交进 git。
+
 ### 还没抽出来但以后可能值得抽的
 
 - 三段式"选模板类型 → 选 sheet → 校验表头"的文件导入流程（`shipment_plan_apply/shipment_templates.py`

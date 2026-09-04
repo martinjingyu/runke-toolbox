@@ -33,6 +33,12 @@ def _build_shipment_plan_apply_panel() -> QWidget:
     return ShipmentPlanApplyPanel()
 
 
+def _build_logistics_tracking_panel() -> QWidget:
+    from .logistics_tracking.panel import LogisticsTrackingPanel
+
+    return LogisticsTrackingPanel()
+
+
 def build_panel() -> QWidget:
     tools = [
         ToolInfo(
@@ -65,6 +71,16 @@ def build_panel() -> QWidget:
             build_panel=_build_shipment_plan_apply_panel,
             dependencies=[
                 pip_package("openpyxl", display_name="openpyxl（读写 Excel）"),
+            ],
+        ),
+        ToolInfo(
+            id="logistics_tracking",
+            name="物流跟踪自动更新",
+            description="按物流商分组，并行去各货代平台查询运单最后路由，自动更新物流跟踪表格",
+            build_panel=_build_logistics_tracking_panel,
+            dependencies=[
+                pip_package("openpyxl", display_name="openpyxl（读写 Excel）"),
+                pip_package("requests", display_name="requests（调用货代平台接口）"),
             ],
         ),
     ]

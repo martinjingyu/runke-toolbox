@@ -7,12 +7,14 @@
   部门内"工具列表 → 点进去具体功能"的导航（`core/hub_widget.py`）、工具按需装依赖的机制（`core/dependency.py`）、
   "预览改动再确认写入"的可复用组件（`core/diff_preview.py`）、写入前自动备份（`core/backup.py`）
 - `modules/` 各部门模块，每个部门一个子目录，`hub.py` 是部门入口（轻量，只列出工具、声明各工具需要的依赖，
-  不 import 具体工具用到的重量级库）。当前只有 `modules/logistics`（物流仓库），三个工具：
+  不 import 具体工具用到的重量级库）。当前只有 `modules/logistics`（物流仓库），四个工具：
   - `walmart_shipment_reconcile`（发货数量核对）：核对箱唛实际发货数量和发货计划表是否一致
   - `fba_label_redact`（FBA 标签发货人信息脱敏）：批量去掉箱唛 PDF 的发货人信息
   - `shipment_plan_apply`（发货计划自动更新）：把运营提交的发货计划表导入，自动更新采购订单汇总表
     和发货计划汇总表——涉及真实业务数据的修改，预览+人工确认+自动备份，是目前最复杂的一个工具，
     也是 `core/diff_preview.py` 这个模板组件的来源
+  - `logistics_tracking`（物流跟踪自动更新）：按物流商分组，并行去各货代平台查询运单最后路由，
+    自动更新物流跟踪表格；登录账号密码在界面里维护，只存本机（`QSettings`），不进 `core/storage`/git
 
   每个工具的依赖都是**业务人员第一次点开这个工具**时才检查/安装，不是软件一启动就全装好——见
   [SETUP.md](SETUP.md) "各工具自己的依赖" 一节。运行 `python main.py` 就能在软件里直接用。
