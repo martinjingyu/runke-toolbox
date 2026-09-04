@@ -28,9 +28,13 @@ class ProductLookup:
     rk_to_huohao: dict[str, str]
 
     def resolve(self, sku_kind: str, sku: str) -> str | None:
-        """sku_kind 是 "AMZ" 或 "RK"。查不到返回 None（由调用方决定怎么报错）。"""
-        table = self.amz_to_huohao if sku_kind == "AMZ" else self.rk_to_huohao
-        return table.get(sku)
+        """先按 RK-SKU 查，查不到再按 AMZ-SKU 查（不管 sku_kind 是哪种——运营表里填错列、
+        或者同一个值本来就两边都用的情况都能兜住）。sku_kind 保留是为了兼容调用方/历史签名，
+        不参与判断了。两边都查不到返回 None（由调用方决定怎么报错）。"""
+        huohao = self.rk_to_huohao.get(sku)
+        if huohao is not None:
+            return huohao
+        return self.amz_to_huohao.get(sku)
 
 
 def load_product_lookup(path: Path) -> ProductLookup:
