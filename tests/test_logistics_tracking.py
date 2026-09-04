@@ -8,6 +8,9 @@
 """
 from __future__ import annotations
 
+import base64
+import json
+
 import openpyxl
 import pytest
 from openpyxl.styles import Border, Font, PatternFill, Side
@@ -238,8 +241,8 @@ def test_get_last_routes_for_carrier_without_accounts_reports_reason():
 
 
 def test_get_last_routes_for_carrier_unimplemented_platform():
-    result = get_last_routes_for_carrier("ZB", [("u", "p")], ["ZB0001"])
-    assert "尚未接入自动查询" in result["ZB0001"].error
+    result = get_last_routes_for_carrier("KQ", [("u", "p")], ["KQ0001"])
+    assert "尚未接入自动查询" in result["KQ0001"].error
 
 
 def test_get_last_routes_for_carrier_unknown_code():
@@ -281,3 +284,133 @@ def test_credential_store_accounts_by_platform_only_includes_configured(settings
     result = store.accounts_by_platform()
     assert result == {"HDJ": [("u1", "p1")], "NK": [("u2", "p2"), ("u3", "p3")]}
     assert "ZB" not in result  # 没配过账号的平台不出现
+
+
+# ---- platforms/ylyn.py ----
+
+
+def test_ylyn_aes_encrypt_produces_decryptable_ciphertext():
+    """壹鹿有你没有官方API文档，请求体是逆向网站前端摸出来的 AES-ECB-PKCS7 + RSA 混合加密
+    （见 ylyn.py 顶部说明——响应不加密，这里只有请求这一侧需要验证）。这个测试不连真实网站，
+    只验证我们自己拼的 AES 密文能被同一把密钥、标准 AES-ECB-PKCS7 解出跟原文一致的内容
+    （相当于站在服务端的角度验证请求体这一路没错）。
+    """
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import unpad
+
+    from modules.logistics.logistics_tracking.platforms import ylyn
+
+    key = ylyn._random_key(32)
+    assert len(key) == 32
+
+    plaintext = json.dumps({"username": "Z9111", "password": "888888"}, ensure_ascii=False)
+    ciphertext_b64 = ylyn._aes_encrypt(plaintext.encode("utf-8"), key.encode())
+    decrypted = unpad(AES.new(key.encode(), AES.MODE_ECB).decrypt(base64.b64decode(ciphertext_b64)), 16)
+    assert decrypted.decode("utf-8") == plaintext
+
+    # encrypt-key 请求头是拿 RSA 公钥加密 base64(key) 得到的，这里验证的是"能正常产出一段
+    # 非空的 base64 密文"，RSA 解密需要私钥（我们没有，也不需要——见模块顶部说明），没法在
+    # 测试里再解回去核对。
+    key_b64 = base64.b64encode(key.encode()).decode()
+    encrypted_key_header = ylyn._rsa_encrypt(key_b64.encode())
+    assert encrypted_key_header
+    base64.b64decode(encrypted_key_header)  # 至少得是合法的 base64
+
+
+def test_ylyn_get_last_routes_matches_by_bill_code(monkeypatch):
+    """get_last_routes() 不联网也能测：跳过真的登录（_login 直接返回假 token），
+    _fetch_all_bills 换成假数据——用来验证"按 billCode 匹配 + trackRuleName/trackRuleDate
+    拼成最后一条轨迹 + 没有轨迹事件的退回用 status + 查不到的运单号报错"这几条规则。
+    """
+    from modules.logistics.logistics_tracking.platforms import ylyn
+
+    monkeypatch.setattr(ylyn.YlynClient, "_login", lambda self, account, password: "fake-token")
+    client = ylyn.YlynClient("Z9111", "888888")
+
+    bills = [
+        {
+            "billCode": "YLDCT26061601567Z9111",
+            "trackRuleName": "签收成功",
+            "trackRuleDate": "2026-07-17 22:00:00",
+            "status": "已签收",
+        },
+        {
+            "billCode": "YLDJK26082591999Z9111",
+            "trackRuleName": None,
+            "trackRuleDate": None,
+            "status": "已出仓",
+        },
+    ]
+    monkeypatch.setattr(client, "_fetch_all_bills", lambda: bills)
+
+    result = client.get_last_routes(
+        ["YLDCT26061601567Z9111", "YLDJK26082591999Z9111", "NOT_EXIST"]
+    )
+
+    assert result["YLDCT26061601567Z9111"].found is True
+    assert result["YLDCT26061601567Z9111"].last_route == "2026-07-17 22:00:00 签收成功"
+
+    assert result["YLDJK26082591999Z9111"].found is True
+    assert result["YLDJK26082591999Z9111"].last_route == "已出仓"  # 没有轨迹事件，退回用状态
+
+    assert result["NOT_EXIST"].found is False
+    assert result["NOT_EXIST"].error == "未找到该运单"
+
+
+# ---- platforms/zhongbao.py ----
+
+
+class _FakeZhongbaoSession:
+    """假 requests.Session，按 trackingRef 查询参数返回预设的响应体，不联网。"""
+
+    def __init__(self, responses: dict[str, dict]):
+        self._responses = responses
+
+    def get(self, url, params, headers, timeout):
+        assert headers == {"appKey": "AK", "appToken": "AT"}
+        waybill = params["trackingRef"]
+        return _FakeZhongbaoResponse(self._responses[waybill])
+
+
+class _FakeZhongbaoResponse:
+    def __init__(self, data: dict):
+        self._data = data
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._data
+
+
+def test_zhongbao_get_last_routes_picks_latest_event_and_reports_failures():
+    """众包一次只能查一个运单号（没有批量接口），get_last_routes() 因此是循环调用；这里验证
+    三种情况：dataList 乱序时按时间取最新一条、4xx 失败码原样透传 description、查到了但没有
+    轨迹事件时报"暂无路由信息"。
+    """
+    from modules.logistics.logistics_tracking.platforms.zhongbao import ZhongbaoClient
+
+    responses = {
+        "ZB0001": {
+            "code": "200",
+            "dataList": [
+                {"time": "2026-07-01 10:00", "context": "已揽收"},
+                {"time": "2026-07-03 08:00", "context": "已到港"},  # 乱序放在中间，得挑到这条
+                {"time": "2026-07-02 09:00", "context": "运输中"},
+            ],
+        },
+        "ZB0002": {"code": "403", "description": "Not authorized!"},
+        "ZB0003": {"code": "200", "dataList": []},
+    }
+    client = ZhongbaoClient(app_key="AK", app_token="AT", session=_FakeZhongbaoSession(responses))
+
+    result = client.get_last_routes(["ZB0001", "ZB0002", "ZB0003"])
+
+    assert result["ZB0001"].found is True
+    assert result["ZB0001"].last_route == "2026-07-03 08:00 已到港"
+
+    assert result["ZB0002"].found is False
+    assert result["ZB0002"].error == "Not authorized!"
+
+    assert result["ZB0003"].found is False
+    assert result["ZB0003"].error == "暂无路由信息"

@@ -39,6 +39,12 @@ def _build_logistics_tracking_panel() -> QWidget:
     return LogisticsTrackingPanel()
 
 
+def _build_purchase_order_import_panel() -> QWidget:
+    from .purchase_order_import.panel import PurchaseOrderImportPanel
+
+    return PurchaseOrderImportPanel()
+
+
 def build_panel() -> QWidget:
     tools = [
         ToolInfo(
@@ -81,6 +87,16 @@ def build_panel() -> QWidget:
             dependencies=[
                 pip_package("openpyxl", display_name="openpyxl（读写 Excel）"),
                 pip_package("requests", display_name="requests（调用货代平台接口）"),
+                pip_package("pycryptodome", import_name="Crypto", display_name="pycryptodome（壹鹿有你/众壹登录用的 AES/RSA 加密）"),
+            ],
+        ),
+        ToolInfo(
+            id="purchase_order_import",
+            name="采购订单批量导入",
+            description="批量读取一个文件夹里的采购订单文件，自动追加进采购订单汇总表和发货计划汇总表",
+            build_panel=_build_purchase_order_import_panel,
+            dependencies=[
+                pip_package("openpyxl", display_name="openpyxl（读写 Excel）"),
             ],
         ),
     ]

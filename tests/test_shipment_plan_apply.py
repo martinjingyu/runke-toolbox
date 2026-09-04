@@ -396,6 +396,62 @@ def test_shipment_summary_convert_in_place_when_exact_match(tmp_path):
     assert ws.cell(row=3, column=8).value == "未发货"
 
 
+def test_shipment_summary_blank_fields_actually_clear_stale_values(tmp_path):
+    # 回归测试：真实数据里"待定"行经常已经带着"编号"/"备注"这些字段的历史值（比如"无库存9"）——
+    # _blank_fields 之前用 ws.cell(row, col, value=None) 清空，这个写法在 openpyxl 里是个坑：
+    # value 只有不是 None 才会真的赋值，传 None 等于没传，格子会原样留着旧值。这里让待定行带上
+    # 非空的 编号/备注，转正/拆分之后必须变成空，不能把旧备注误当成新记录的状态。
+    path = tmp_path / "summary.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    headers = ["采购单号", "型号", "箱数", "箱容", "数量", "ZD", "发货时间", "状态",
+               "仓库", "FBA ID", "追踪编号", "备注", "货代", "出货单号", "so", "编号"]
+    ws.append(headers)
+    ws.append(["PO-1", "M1", 5, 3, 15, None, "待定", "未发货", "旧仓库", "旧FBA", "旧追踪", "无库存9", "旧货代", "旧出货单", None, 3])
+    ws.append(["PO-2", "M2", 2, 3, 6, None, "待定", "未发货", "旧仓库2", None, None, "另一条旧备注", None, None, None, 8])
+    wb.save(path)
+
+    wb2 = openpyxl.load_workbook(path)
+    ws2 = wb2.active
+    book = ShipmentSummaryBook(ws2)
+
+    # insert_above：新行是从待定行复制出来的，旧的 仓库/FBA/追踪/备注/货代/出货单/编号 都不该带过去
+    changes = book.apply_shipment("PO-1", "M1", 5, "ZD1", dt.date(2026, 9, 1))
+    new_row = changes[0].new_row
+    for col in (9, 10, 11, 12, 13, 14, 16):  # 仓库/FBA ID/追踪编号/备注/货代/出货单号/编号
+        assert ws2.cell(row=new_row, column=col).value is None, f"col {col} 应该清空"
+
+    # convert_in_place：原地转正的那一行自己带的旧值也要被清掉
+    changes2 = book.apply_shipment("PO-2", "M2", 6, "ZD2", dt.date(2026, 9, 1))
+    pending_row = changes2[0].pending_row
+    for col in (9, 10, 11, 12, 13, 14, 16):
+        assert ws2.cell(row=pending_row, column=col).value is None, f"col {col} 应该清空"
+
+
+def test_shipment_summary_missing_box_capacity_still_updates_boxes(tmp_path):
+    # 回归测试：_set_explicit_fields/拆分剩余量那两处算出来的箱数在箱容缺失时会是 None——
+    # 之前同样因为 ws.cell(..., value=None) 是 no-op，箱容缺失的行拆分/转正之后箱数格子会
+    # 留着旧值，跟新的「数量」对不上。这里箱容留空，箱数原来的旧值应该被清掉，不能留着旧数字。
+    path = tmp_path / "summary.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["采购单号", "型号", "箱数", "箱容", "数量", "ZD", "发货时间", "状态",
+               "仓库", "FBA ID", "追踪编号", "备注", "货代", "出货单号", "so", "编号"])
+    ws.append(["PO-1", "M1", 999, None, 15, None, "待定", "未发货", None, None, None, None, None, None, None, None])
+    wb.save(path)
+
+    wb2 = openpyxl.load_workbook(path)
+    ws2 = wb2.active
+    book = ShipmentSummaryBook(ws2)
+
+    changes = book.apply_shipment("PO-1", "M1", 5, "ZD1", dt.date(2026, 9, 1))
+    new_row, pending_row = changes[0].new_row, changes[0].pending_row
+    # 箱容缺失，箱数算不出来，应该是 None，不能留着模板行的旧箱数 999
+    assert ws2.cell(row=new_row, column=3).value is None
+    assert ws2.cell(row=pending_row, column=3).value is None
+    assert ws2.cell(row=pending_row, column=5).value == 10  # 数量本身照样正确扣减
+
+
 def test_shipment_summary_pending_row_not_found_raises(tmp_path):
     path = tmp_path / "summary.xlsx"
     _write_summary_book(path)

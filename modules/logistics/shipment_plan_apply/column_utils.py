@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import re
+from copy import copy as copy_style
 
 from openpyxl.utils import column_index_from_string
 from openpyxl.worksheet.worksheet import Worksheet
 
 _CELL_REF_RE = re.compile(r"\b([A-Za-z]{1,3})(\d+)\b")
+_FORMULA_REF_RE = re.compile(r"([A-Za-z]{1,3})(\d+)")
 # 公式原文里，把所有"单元格引用"都挖掉之后，剩下的字符必须只有这些运算符/数字/空白——这样
 # 才能保证公式本身就是"若干个单元格引用做加减乘除或者用 & 拼起来"，没有别的花活（函数调用、
 # 跨表/外部工作簿引用、写死的文本常量）。这个检查要在"把单元格引用换成实际值"之前做：型号、
@@ -116,6 +118,49 @@ def require_columns(mapping: dict[str, int], names: list[str], context: str) -> 
     if missing:
         raise HeaderNotFoundError(f"{context}缺少必须的表头：{missing}")
     return {n: mapping[n] for n in names}
+
+
+def reindex_formula(formula: str, old_row: int, new_row: int) -> str:
+    """公式原文里，把"引用自己这一行"的单元格引用（行号正好等于 old_row 的）换成 new_row，
+    其它行号的引用原样保留——给"整行复制到别的行"用的，不是"插入一行、后面所有行整体下移"
+    那种要把一大片引用都 +1 的场景（那种见 shipment_summary.py 的 _shift_formula_refs）。
+    """
+
+    def repl(m: re.Match) -> str:
+        letters, digits = m.group(1), m.group(2)
+        if int(digits) == old_row:
+            return f"{letters}{new_row}"
+        return m.group(0)
+
+    return _FORMULA_REF_RE.sub(repl, formula)
+
+
+def copy_row(ws: Worksheet, dest_row: int, src_row: int, max_col: int | None = None) -> None:
+    """整行复制：值、公式（自引用部分按 src_row -> dest_row 重新指向，见 reindex_formula）、
+    格式（字体/填充/边框/对齐/数字格式/保护）、行高都复制过去——用在"接在表格最后一行下面
+    追加一条新记录，但要长得跟原来的行一样"这种场景，不用逐个字段判断"这一列是不是公式、
+    要不要抄格式"。
+
+    注意这只处理"整行复制"本身；复制完之后调用方通常还要在上面用具体的业务值覆盖某些列
+    （比如型号、数量这些一行一个样的字段），这个函数不负责判断哪些列该覆盖。
+    """
+    max_col = max_col or ws.max_column
+    for c in range(1, max_col + 1):
+        src_cell = ws.cell(row=src_row, column=c)
+        dest_cell = ws.cell(row=dest_row, column=c)
+        value = src_cell.value
+        if isinstance(value, str) and value.startswith("="):
+            value = reindex_formula(value, src_row, dest_row)
+        dest_cell.value = value
+        if src_cell.has_style:
+            dest_cell.font = copy_style(src_cell.font)
+            dest_cell.fill = copy_style(src_cell.fill)
+            dest_cell.border = copy_style(src_cell.border)
+            dest_cell.alignment = copy_style(src_cell.alignment)
+            dest_cell.number_format = src_cell.number_format
+            dest_cell.protection = copy_style(src_cell.protection)
+    if src_row in ws.row_dimensions:
+        ws.row_dimensions[dest_row].height = ws.row_dimensions[src_row].height
 
 
 def read_row(ws: Worksheet, row: int, header_row: int) -> dict:

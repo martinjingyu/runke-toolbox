@@ -20,13 +20,19 @@ from typing import Callable
 from .base import RouteResult
 from .nextsls import NextslsClient
 from .niuku import NiukuClient
+from .ylyn import YlynClient
+from .zhongbao import ZhongbaoClient
 
 # 物流商代码 -> 中文展示名。代码就是出货跟踪表"物流商"列里的缩写，账号管理界面的下拉框、
 # 预览表格里的"平台尚未接入自动查询"提示都用这份名单，加新物流商在这里加一行就行。
+#
+# ZB 曾经错标成"至美通"(zipto.cn)——跟业务确认过，表格里"物流商"列写 ZB 的实际指"众包"
+# (ops.zbao56.com)，两家是完全不同的公司；凯琦(KQ)还在调研查询接口，暂时还没接进来，继续走
+# 下面的 _not_implemented()。
 PLATFORM_LABELS: dict[str, str] = {
     "HDJ": "海德嘉",
     "HX": "恒信",
-    "ZB": "至美通",
+    "ZB": "众包",
     "KQ": "凯琦",
     "XQH": "新企航",
     "YH": "盈和",
@@ -40,6 +46,13 @@ PLATFORM_LABELS: dict[str, str] = {
 _NEXTSLS_BASE_URLS: dict[str, str] = {
     "HDJ": "http://haidej.nextsls.com",
     "HX": "http://hengxe.nextsls.com",
+}
+
+# 壹鹿有你(YLYN)那套若依风格后台，"众壹"(ZY)是同一个系统的另一个租户/品牌——域名不同、
+# RSA公钥/clientId都一样，见 ylyn.py 顶部说明。
+_YLYN_DOMAINS: dict[str, str] = {
+    "YLYN": "yl.noms.logistics-tms.com",
+    "ZY": "zy.noms.logistics-tms.com",
 }
 
 Account = tuple[str, str]  # (账号, 密码)，按优先尝试顺序排列
@@ -121,6 +134,27 @@ def get_last_routes_for_carrier(
 
         def factory(account: str, password: str) -> NiukuClient:
             return NiukuClient(account=account, password=password)
+
+        return _lookup_multi_account(factory, accounts, waybill_numbers)
+
+    if carrier_code in _YLYN_DOMAINS:
+        if not accounts:
+            return _no_accounts(label, waybill_numbers)
+        domain = _YLYN_DOMAINS[carrier_code]
+
+        def factory(account: str, password: str) -> YlynClient:
+            return YlynClient(account=account, password=password, base_url=f"https://{domain}/prod-api", domain=domain)
+
+        return _lookup_multi_account(factory, accounts, waybill_numbers)
+
+    if carrier_code == "ZB":
+        if not accounts:
+            return _no_accounts(label, waybill_numbers)
+
+        # 众包这家"账号管理"里存的其实是 appKey/appToken(一对应用级密钥，不是网页登录密码)，
+        # 借用同一套账号密码 UI 的两个输入框存，见 zhongbao.py 顶部说明。
+        def factory(app_key: str, app_token: str) -> ZhongbaoClient:
+            return ZhongbaoClient(app_key=app_key, app_token=app_token)
 
         return _lookup_multi_account(factory, accounts, waybill_numbers)
 

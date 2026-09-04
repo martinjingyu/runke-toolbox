@@ -209,8 +209,11 @@ class ShipmentSummaryBook:
 
             remaining = pending_qty - quantity
             remaining_boxes, _ = _compute_boxes(remaining, box_capacity)
-            self.ws.cell(row=template_row, column=self.col["数量"], value=remaining)
-            self.ws.cell(row=template_row, column=self.col["箱数"], value=remaining_boxes)
+            self.ws.cell(row=template_row, column=self.col["数量"]).value = remaining
+            # remaining_boxes 箱容缺失/不合法时会是 None——用 .value = 显式赋值，不然
+            # ws.cell(..., value=None) 是个 no-op，待定行会留着拆分前的旧箱数，跟拆分后
+            # 变小的「数量」对不上。
+            self.ws.cell(row=template_row, column=self.col["箱数"]).value = remaining_boxes
 
             return ShipmentSummaryChange(
                 kind="insert_above",
@@ -302,19 +305,26 @@ class ShipmentSummaryBook:
     def _set_explicit_fields(
         self, row: int, order_no: str, model: str, quantity: int, boxes, zd: str, ship_date: dt.date, status: str
     ) -> None:
-        self.ws.cell(row=row, column=self.col["采购单号"], value=order_no)
-        self.ws.cell(row=row, column=self.col["型号"], value=model)
-        self.ws.cell(row=row, column=self.col["数量"], value=quantity)
-        self.ws.cell(row=row, column=self.col["箱数"], value=boxes)
-        self.ws.cell(row=row, column=self.col["ZD"], value=zd)
-        self.ws.cell(row=row, column=self.col["发货时间"], value=dt.datetime.combine(ship_date, dt.time()))
-        self.ws.cell(row=row, column=self.col["状态"], value=status)
+        # 统一用 .value = 显式赋值，不用 ws.cell(..., value=X)——那种写法碰到 X 是 None 时
+        # （比如箱容缺失、_compute_boxes 算不出箱数）什么都不会写，格子会留着 insert_above
+        # 从模板行复制过来的旧箱数，跟新的「数量」对不上。
+        self.ws.cell(row=row, column=self.col["采购单号"]).value = order_no
+        self.ws.cell(row=row, column=self.col["型号"]).value = model
+        self.ws.cell(row=row, column=self.col["数量"]).value = quantity
+        self.ws.cell(row=row, column=self.col["箱数"]).value = boxes
+        self.ws.cell(row=row, column=self.col["ZD"]).value = zd
+        self.ws.cell(row=row, column=self.col["发货时间"]).value = dt.datetime.combine(ship_date, dt.time())
+        self.ws.cell(row=row, column=self.col["状态"]).value = status
 
     def _blank_fields(self, row: int) -> None:
         for field in BLANK_FIELDS:
             col = self.col.get(field)
             if col is not None:
-                self.ws.cell(row=row, column=col, value=None)
+                # ws.cell(..., value=None) 在 openpyxl 里不会真的清空格子——cell() 只有 value
+                # 不是 None 才会赋值，传 None 等于没传。真实表里的待定行经常已经带着"编号"
+                # "备注"这些字段的历史值（比如"无库存9"），这一行转正/拆分出新行的时候必须
+                # 显式设 .value 才能真的清掉，不然这些历史备注会原样留在新的已发货/未发货记录上。
+                self.ws.cell(row=row, column=col).value = None
 
 
 def _compute_boxes(quantity: int, box_capacity) -> tuple[float | None, bool]:
