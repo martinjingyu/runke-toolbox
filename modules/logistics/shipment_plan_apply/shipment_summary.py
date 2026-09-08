@@ -117,7 +117,7 @@ def _grow_tail_formula(formula: str, old_tail_row: int, new_tail_row: int) -> st
 class ShipmentSummaryBook:
     def __init__(self, ws: Worksheet):
         self.ws = ws
-        self.header_row = find_header_row(ws, REQUIRED_HEADERS, max_scan_rows=10)
+        self.header_row = find_header_row(ws, REQUIRED_HEADERS, max_scan_rows=10, context="发货计划汇总表")
         cols = column_index_map(ws, self.header_row)
         self.col = require_columns(cols, REQUIRED_HEADERS, "发货计划汇总表")
         # openpyxl 的 ws.max_row / ws.max_column 不是缓存属性——每次访问都要把底层存储重新扫一遍

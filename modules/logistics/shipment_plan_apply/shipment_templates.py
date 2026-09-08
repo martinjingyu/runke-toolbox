@@ -83,14 +83,15 @@ def parse_shipment_plan(
             "需要手动指定模板类型"
         )
 
+    context = f"「{path.name}」（{sheet_name}）"
     if resolved_type == "walmart":
-        header_row = find_header_row(ws, WALMART_HEADERS)
+        header_row = find_header_row(ws, WALMART_HEADERS, context=context)
         lines, errors = _parse_walmart(ws, header_row)
     elif resolved_type == "amazon":
-        header_row = find_header_row(ws, AMAZON_HEADERS)
+        header_row = find_header_row(ws, AMAZON_HEADERS, context=context)
         lines, errors = _parse_amazon(ws, header_row)
     elif resolved_type == "overseas":
-        lines, errors = _parse_overseas(ws)
+        lines, errors = _parse_overseas(ws, context=context)
     else:
         raise ValueError(f"不认识的模板类型：{resolved_type}")
 
@@ -234,10 +235,10 @@ def _parse_amazon(ws: Worksheet, header_row: int) -> tuple[list[PlanLine], list[
     return lines, errors
 
 
-def _parse_overseas(ws: Worksheet) -> tuple[list[PlanLine], list[str]]:
-    header_row = find_header_row(ws, OVERSEAS_HEADERS, max_scan_rows=3)
+def _parse_overseas(ws: Worksheet, context: str = "海外仓发货计划表") -> tuple[list[PlanLine], list[str]]:
+    header_row = find_header_row(ws, OVERSEAS_HEADERS, max_scan_rows=3, context=context)
     cols = column_index_map(ws, header_row)
-    idx = require_columns(cols, OVERSEAS_HEADERS, "海外仓发货计划表")
+    idx = require_columns(cols, OVERSEAS_HEADERS, context)
     sku_col = idx["海外仓-SKU"]
 
     dest_row = header_row + 1

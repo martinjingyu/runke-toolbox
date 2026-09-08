@@ -41,7 +41,7 @@ def load_product_lookup(path: Path) -> ProductLookup:
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     ws = wb.active
 
-    header_row = find_header_row(ws, REQUIRED_HEADERS)
+    header_row = find_header_row(ws, REQUIRED_HEADERS, context="在售产品信息总表")
     cols = column_index_map(ws, header_row)
     idx = require_columns(cols, REQUIRED_HEADERS, "在售产品信息总表")
     amz_col = idx["AMZ-SKU"]

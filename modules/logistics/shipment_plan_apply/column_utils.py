@@ -89,12 +89,20 @@ class HeaderNotFoundError(Exception):
     pass
 
 
-def find_header_row(ws: Worksheet, required_headers: list[str], max_scan_rows: int = 10) -> int:
+def find_header_row(
+    ws: Worksheet, required_headers: list[str], max_scan_rows: int = 10, context: str = "这份表格"
+) -> int:
     """在前 max_scan_rows 行里找到同时包含所有 required_headers 的那一行，返回行号（1-indexed）。
 
     ws[row_idx] 这种按行号取值的写法，如果 row_idx 超过表格实际的行数（比如整张表只有 3 行，
     却要看第 5 行），在 read_only 模式下会直接抛 IndexError 而不是返回空行——所以扫描范围要用
     表格实际的行数封顶，不能不管三七二十一扫到 max_scan_rows。
+
+    context：报错信息里要点名是"哪一张表"找不到表头——这个工具一次要读好几张不同的表（在售
+    产品信息总表/采购订单汇总表/发货计划汇总表/运营给的发货计划表……），报错只说"找不到表头"
+    不说是哪张表，人没法一眼定位该去检查哪份文件，必须自己一张张点开表格对照猜。调用方应该
+    传一个人能看懂的表格名字（比如"发货计划汇总表"），不传的话退化成"这份表格"这种通用说法，
+    至少不会崩，但排查起来还是不如传了清楚。
     """
     last_row = min(max_scan_rows, ws.max_row or 0)
     for row_idx in range(1, last_row + 1):
@@ -102,7 +110,7 @@ def find_header_row(ws: Worksheet, required_headers: list[str], max_scan_rows: i
         if all(h in values for h in required_headers):
             return row_idx
     raise HeaderNotFoundError(
-        f"在前 {max_scan_rows} 行里没找到包含这些表头的行：{required_headers}"
+        f"{context}：在前 {max_scan_rows} 行里没找到包含这些表头的行：{required_headers}"
     )
 
 

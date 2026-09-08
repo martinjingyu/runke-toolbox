@@ -60,7 +60,7 @@ def load_vendor_lookup(path: str | Path) -> VendorLookup:
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     ws = wb.active
 
-    header_row = find_header_row(ws, VENDOR_LOOKUP_REQUIRED_HEADERS)
+    header_row = find_header_row(ws, VENDOR_LOOKUP_REQUIRED_HEADERS, context="产品信息表")
     cols = column_index_map(ws, header_row)
     idx = require_columns(cols, VENDOR_LOOKUP_REQUIRED_HEADERS, "产品信息表")
     amz_col = idx["AMZ-SKU"]

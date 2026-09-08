@@ -6,7 +6,7 @@ import pytest
 from openpyxl.styles import Border, PatternFill, Side
 
 from core.diff_preview import GROUP_KEY
-from modules.logistics.shipment_plan_apply.column_utils import resolve_cell_value
+from modules.logistics.shipment_plan_apply.column_utils import HeaderNotFoundError, resolve_cell_value
 from modules.logistics.shipment_plan_apply.diff import run_and_capture_diff
 from modules.logistics.shipment_plan_apply.planner import build_plan, apply_plan
 from modules.logistics.shipment_plan_apply.product_lookup import ProductLookupError, load_product_lookup
@@ -171,6 +171,24 @@ def test_parse_overseas_plan(tmp_path):
     assert all(l.zd == l.destination_label for l in plan.lines)  # 海外仓：ZD 就是目的仓列头
 
 
+def test_parse_shipment_plan_missing_headers_names_the_file_and_sheet(tmp_path):
+    # 回归测试：这个工具一次要读好几张不同的表，报错只说"找不到表头"不说是哪张表/哪个
+    # sheet，人没法一眼定位该去检查哪份文件。文件名和 sheet 名都要出现在报错里。
+    path = tmp_path / "运营发的沃尔玛计划.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "9月计划"
+    ws.append(["店铺", "RK-SKU", "没有预计发货数量这一列"])
+    ws.append(["CK-沃尔玛", "TD-348", 21])
+    wb.save(path)
+
+    with pytest.raises(HeaderNotFoundError) as exc_info:
+        parse_shipment_plan(path, "9月计划", template_type="walmart")
+    message = str(exc_info.value)
+    assert "运营发的沃尔玛计划.xlsx" in message
+    assert "9月计划" in message
+
+
 # ---------------------------------------------------------------------------
 # product_lookup
 # ---------------------------------------------------------------------------
@@ -210,6 +228,17 @@ def test_product_lookup_raises_on_conflicting_mapping(tmp_path):
         ],
     )
     with pytest.raises(ProductLookupError):
+        load_product_lookup(path)
+
+
+def test_product_lookup_missing_headers_names_the_table(tmp_path):
+    path = tmp_path / "product.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["AMZ-SKU", "RK-SKU"])  # 缺"同款"这一列
+    wb.save(path)
+
+    with pytest.raises(HeaderNotFoundError, match="在售产品信息总表"):
         load_product_lookup(path)
 
 
@@ -314,6 +343,18 @@ def test_purchase_book_insert_date_column_preserves_formatting(tmp_path):
     assert ws3.column_dimensions[get_column_letter(mid_col + 1)].width == 9.5  # 原来的 G 右移，列宽跟过去
     assert ws3.cell(3, mid_col).fill.fgColor.rgb == "000000FF"
     assert ws3.cell(3, mid_col).border.top.style == "thin"
+
+
+def test_purchase_book_missing_headers_names_the_table(tmp_path):
+    path = tmp_path / "purchase.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["订单号", "型号"])  # 缺"采购日期"等必须的列
+    wb.save(path)
+
+    wb2 = openpyxl.load_workbook(path, data_only=False)
+    with pytest.raises(HeaderNotFoundError, match="采购订单汇总表"):
+        PurchaseBook(wb2.active)
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +649,18 @@ def test_shipment_summary_quantity_exceeding_pending_raises(tmp_path):
     # "刚好发完"原地转正、把数字写错
     with pytest.raises(Exception):
         book.apply_shipment("PO-1", "M1", 999, "ZD1", dt.date(2026, 9, 1))
+
+
+def test_shipment_summary_missing_headers_names_the_table(tmp_path):
+    path = tmp_path / "summary.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["采购单号", "型号"])  # 缺"发货时间"等必须的列
+    wb.save(path)
+
+    wb2 = openpyxl.load_workbook(path)
+    with pytest.raises(HeaderNotFoundError, match="发货计划汇总表"):
+        ShipmentSummaryBook(wb2.active)
 
 
 # ---------------------------------------------------------------------------
