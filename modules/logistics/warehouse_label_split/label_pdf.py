@@ -1,4 +1,4 @@
-"""解析入库标签 PDF（比如 CA1.pdf）。
+"""解析 CA1 站点的入库标签 PDF（比如 CA1.pdf）。
 
 每个箱子占连续两页：
     第一页"Inbound"——收件人/仓库信息，没有 SKU 明细；
@@ -14,29 +14,12 @@ SKU 明细）都不硬猜——直接报错，交给人工核对，跟 fba_label
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 
 import fitz
 
+from .box import Box, BoxItem, LabelPdfStructureError
+
 _BOX_NO_RE = re.compile(r"Box No\.\s*\n(\S+)")
-
-
-class LabelPdfStructureError(Exception):
-    pass
-
-
-@dataclass
-class BoxItem:
-    sku: str
-    quantity: int
-
-
-@dataclass
-class Box:
-    box_no: str
-    inbound_page: int
-    packing_page: int
-    items: list[BoxItem]
 
 
 def _box_no(text: str) -> str | None:
@@ -91,6 +74,6 @@ def parse_label_pdf(doc: fitz.Document) -> list[Box]:
             )
 
         items = _parse_packing_list_items(packing_text)
-        boxes.append(Box(box_no=inbound_box_no, inbound_page=i, packing_page=i + 1, items=items))
+        boxes.append(Box(box_no=inbound_box_no, pages=(i, i + 1), items=items))
 
     return boxes

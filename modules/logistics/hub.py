@@ -47,10 +47,18 @@ def _build_purchase_order_import_panel() -> QWidget:
     return PurchaseOrderImportPanel()
 
 
-def _build_warehouse_label_split_panel() -> QWidget:
-    from .warehouse_label_split.panel import WarehouseLabelSplitPanel
+def _build_ca1_label_split_panel() -> QWidget:
+    from .warehouse_label_split.label_pdf import parse_label_pdf
+    from .warehouse_label_split.panel import LabelSplitPanel
 
-    return WarehouseLabelSplitPanel()
+    return LabelSplitPanel("CA1 入库标签 PDF 拆分", "CA1.pdf", parse_label_pdf)
+
+
+def _build_cg_label_split_panel() -> QWidget:
+    from .warehouse_label_split.label_pdf_cg import parse_label_pdf
+    from .warehouse_label_split.panel import LabelSplitPanel
+
+    return LabelSplitPanel("CG 入库标签 PDF 拆分", "CG-TS-MD.pdf", parse_label_pdf)
 
 
 def build_panel() -> QWidget:
@@ -109,10 +117,20 @@ def build_panel() -> QWidget:
             ],
         ),
         ToolInfo(
-            id="warehouse_label_split",
+            id="ca1_label_split",
             name="CA1 入库标签 PDF 拆分",
             description="按发货计划表里仓库含 CA1、未发货的标签，把一份入库标签 PDF 拆成一个标签一个文件",
-            build_panel=_build_warehouse_label_split_panel,
+            build_panel=_build_ca1_label_split_panel,
+            dependencies=[
+                pip_package("pymupdf", import_name="fitz", display_name="PyMuPDF（读取/拆分 PDF）"),
+                pip_package("openpyxl", display_name="openpyxl（读发货计划表）"),
+            ],
+        ),
+        ToolInfo(
+            id="cg_label_split",
+            name="CG 入库标签 PDF 拆分",
+            description="按发货计划表里仓库含 CG、未发货的标签，把一份入库标签 PDF 拆成一个标签一个文件",
+            build_panel=_build_cg_label_split_panel,
             dependencies=[
                 pip_package("pymupdf", import_name="fitz", display_name="PyMuPDF（读取/拆分 PDF）"),
                 pip_package("openpyxl", display_name="openpyxl（读发货计划表）"),

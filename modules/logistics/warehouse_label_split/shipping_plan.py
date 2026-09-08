@@ -1,11 +1,12 @@
-"""读取发货计划表，只找「标签」在 wanted_labels 里的、「仓库」包含 CA1、且「状态=未发货」
-的行——不再要求「发货时间=待定」，只要还没发货就算数，不管是已经安排了具体发货日期还是
-仍然待定。
+"""读取发货计划表，只找「标签」在 wanted_labels 里的、「仓库」包含 warehouse_code、且
+「状态=未发货」的行——不要求「发货时间=待定」，只要还没发货就算数，不管是已经安排了具体
+发货日期还是仍然待定。
 
-「仓库」包含 CA1 这个条件是因为这个工具目前专门服务 CA1 这个站点：真实表里「仓库」的值形如
-"US(CA1)"，不是精确等于"CA1"，所以按包含匹配，不做精确相等。同一个标签完全可能同时发往好
-几个不同仓库（发货计划表里横跨全公司所有站点），不加这个条件的话，箱数会把发去别的仓库、
-跟这份 CA1 标签 PDF 毫无关系的待发记录也一起加进来，数字对不上。
+warehouse_code 由调用方传入（见 splitter.py 里从标签 PDF 文件名推导站点代号的说明），不在
+这里写死成某一个站点——真实表里「仓库」的值形如"US(CA1)"，不是精确等于站点代号，所以按包含
+匹配，不做精确相等。同一个标签完全可能同时发往好几个不同仓库（发货计划表里横跨全公司所有
+站点），不加这个条件的话，箱数会把发去别的仓库、跟这份标签 PDF 毫无关系的待发记录也一起加
+进来，数字对不上。
 
 wanted_labels 由调用方传入，是标签 PDF 里实际出现过的那些标签——发货计划表本身有几万行，
 横跨所有产品全部历史批次，跟这一份标签 PDF 完全无关的标签不该在这里被读出来，也不该被拿去
@@ -31,7 +32,6 @@ from ..shipment_plan_apply.column_utils import column_index_map, find_header_row
 REQUIRED_HEADERS = ["标签", "状态", "箱数", "工厂", "仓库"]
 
 PENDING_STATUS = "未发货"
-WAREHOUSE_CODE = "CA1"
 
 
 @dataclass
@@ -56,7 +56,7 @@ def _num(value) -> float:
 
 
 def load_pending_groups(
-    xlsx_path: str | Path, wanted_labels: set[str], sheet_name: str | None = None
+    xlsx_path: str | Path, wanted_labels: set[str], warehouse_code: str, sheet_name: str | None = None
 ) -> PendingGroups:
     wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
     ws = wb[sheet_name] if sheet_name else wb[wb.sheetnames[0]]
@@ -82,7 +82,7 @@ def load_pending_groups(
             continue
 
         warehouse = row[idx["仓库"] - 1].value
-        if warehouse is None or WAREHOUSE_CODE not in str(warehouse):
+        if warehouse is None or warehouse_code not in str(warehouse):
             continue
 
         factory = row[idx["工厂"] - 1].value

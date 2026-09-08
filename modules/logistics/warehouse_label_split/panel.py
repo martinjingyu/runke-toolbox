@@ -1,5 +1,9 @@
 """入库标签 PDF 拆分——这个工具自己的界面。
 
+不同站点的标签 PDF 版式不一样（见 splitter.py 里 parse_boxes 的说明），但界面和交互是
+通用的，所以做成一个可以传参数复用的面板类，每个站点在 hub.py 里各自 new 一个实例，传各自
+的标题、示例文件名提示、解析函数。
+
 跟 fba_label_redact 一样是纯文本/PDF 拼页操作，没有条码解码、没有 OCR，实测很快，放后台
 线程跑但不需要进度条/协作式取消。
 """
@@ -22,7 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .splitter import OUTPUT_DIR_NAME, SplitReport
+from .splitter import OUTPUT_DIR_NAME, ParseBoxesFn, SplitReport
 from .splitter import run as run_split
 
 
@@ -30,14 +34,15 @@ class _SplitWorker(QThread):
     succeeded = Signal(object)  # SplitReport
     failed = Signal(str)
 
-    def __init__(self, label_pdf_path: str, shipping_plan_path: str):
+    def __init__(self, label_pdf_path: str, shipping_plan_path: str, parse_boxes: ParseBoxesFn):
         super().__init__()
         self._label_pdf_path = label_pdf_path
         self._shipping_plan_path = shipping_plan_path
+        self._parse_boxes = parse_boxes
 
     def run(self):
         try:
-            report = run_split(self._label_pdf_path, self._shipping_plan_path)
+            report = run_split(self._label_pdf_path, self._shipping_plan_path, self._parse_boxes)
         except Exception as exc:
             self.failed.emit(str(exc))
             return
@@ -45,10 +50,12 @@ class _SplitWorker(QThread):
 
 
 def _file_picker_row(label_text: str, filter_text: str, on_pick) -> tuple[QHBoxLayout, QLineEdit]:
+    # 不设 setReadOnly(True)——很多时候路径是从别处（比如资源管理器地址栏、聊天记录）复制来的，
+    # 直接粘贴到输入框比每次都弹文件选择框方便，所以这里允许手动输入/粘贴，「浏览…」按钮只是
+    # 另一种更省事的填法，不是唯一填法。
     row = QHBoxLayout()
     row.addWidget(QLabel(label_text))
     line_edit = QLineEdit()
-    line_edit.setReadOnly(True)
     row.addWidget(line_edit, 1)
     button = QPushButton("浏览…")
     button.clicked.connect(lambda: on_pick(line_edit))
@@ -56,30 +63,32 @@ def _file_picker_row(label_text: str, filter_text: str, on_pick) -> tuple[QHBoxL
     return row, line_edit
 
 
-class WarehouseLabelSplitPanel(QWidget):
-    def __init__(self):
+class LabelSplitPanel(QWidget):
+    def __init__(self, title: str, example_file_name: str, parse_boxes: ParseBoxesFn):
         super().__init__()
+        self._parse_boxes = parse_boxes
         self._worker: _SplitWorker | None = None
         self._output_dir: Path | None = None
 
         layout = QVBoxLayout(self)
 
-        title = QLabel("CA1 入库标签 PDF 拆分")
-        title.setStyleSheet("font-size: 16px; font-weight: bold;")
-        layout.addWidget(title)
+        title_label = QLabel(title)
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+        layout.addWidget(title_label)
 
         inputs_box = QGroupBox("输入")
         inputs_layout = QVBoxLayout(inputs_box)
 
-        row, self._label_pdf_edit = _file_picker_row("入库标签 PDF（比如 CA1.pdf）", "PDF 文件 (*.pdf)", self._browse_label_pdf)
+        row, self._label_pdf_edit = _file_picker_row(f"入库标签 PDF（比如 {example_file_name}）", "PDF 文件 (*.pdf)", self._browse_label_pdf)
         inputs_layout.addLayout(row)
 
         row, self._plan_edit = _file_picker_row("发货计划表", "Excel 文件 (*.xlsx *.xlsm)", self._browse_plan)
         inputs_layout.addLayout(row)
 
         hint = QLabel(
-            "按发货计划表里「仓库含 CA1、状态=未发货」的标签，从入库标签 PDF 里抽出对应箱子的页面，"
-            "按 厂商代号_标签_箱数合计.pdf 命名，存到标签 PDF 所在目录下新建的「output」文件夹。"
+            "站点代号取自入库标签 PDF 的文件名（第一个「-」之前的部分）。"
+            "按发货计划表里「仓库含这个站点代号、状态=未发货」的标签，从入库标签 PDF 里抽出对应箱子的页面，"
+            "按「厂商代号 标签 箱数合计箱.pdf」命名，存到标签 PDF 所在目录下新建的「output」文件夹。"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: gray;")
@@ -136,7 +145,7 @@ class WarehouseLabelSplitPanel(QWidget):
         self._log.clear()
 
         self._output_dir = Path(label_pdf_path).parent / OUTPUT_DIR_NAME
-        self._worker = _SplitWorker(label_pdf_path, plan_path)
+        self._worker = _SplitWorker(label_pdf_path, plan_path, self._parse_boxes)
         self._worker.succeeded.connect(self._on_success)
         self._worker.failed.connect(self._on_failure)
         self._worker.start()
