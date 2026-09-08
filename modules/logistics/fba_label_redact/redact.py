@@ -44,6 +44,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -72,6 +73,9 @@ def _find_cjk_font_path() -> str | None:
 
 
 _CJK_FONT_PATH = _find_cjk_font_path()  # 进程启动时找一次，不用每画一行字就查一次文件系统
+_CJK_FONT = fitz.Font(fontfile=_CJK_FONT_PATH) if _CJK_FONT_PATH is not None else None
+# 量文字宽度用的——fitz.get_text_length() 只认 Base14/CJK 保留名字这些"标准字体"，认不出自定义
+# fontfile，得用 fitz.Font 对象自己的 text_length()，所以这里把字体对象也缓存一份
 
 
 @dataclass
@@ -105,18 +109,70 @@ def _is_latin_font(source_font: str) -> bool:
     return "helvetica" in source_font.lower()
 
 
+def _draw_run(page: fitz.Page, x: float, baseline_y: float, text: str, source_font: str, size: float) -> float:
+    """画一段文字，返回这段文字的宽度——给"一行里要接着拼另一种字体的文字"这种场景用，
+    知道前一段画完到哪儿了，后一段才能紧接着从那个位置开始画。"""
+    if _is_latin_font(source_font):
+        page.insert_text((x, baseline_y), text, fontname="Helvetica", fontsize=size, color=(0, 0, 0))
+        return fitz.get_text_length(text, fontname="Helvetica", fontsize=size)
+    if _CJK_FONT_PATH is not None:
+        page.insert_text(
+            (x, baseline_y), text, fontname=_CJK_FONT_NAME, fontfile=_CJK_FONT_PATH, fontsize=size, color=(0, 0, 0)
+        )
+        return _CJK_FONT.text_length(text, fontsize=size)
+    page.insert_text((x, baseline_y), text, fontname="china-s", fontsize=size, color=(0, 0, 0))
+    return fitz.get_text_length(text, fontname="china-s", fontsize=size)
+
+
 def _draw_line(page: fitz.Page, x: float, top_y: float, text: str, source_font: str, size: float) -> None:
     """按 source_font 判断这行文字在原文档里用的是拉丁字体还是中文字体，画的时候原样沿用，
     字号也用原文档这一行自己的字号（不同行字号本来就不一样，别再统一写死 8pt）。"""
     baseline_y = top_y + size * _BASELINE_RATIO
-    if _is_latin_font(source_font):
-        page.insert_text((x, baseline_y), text, fontname="Helvetica", fontsize=size, color=(0, 0, 0))
-    elif _CJK_FONT_PATH is not None:
-        page.insert_text(
-            (x, baseline_y), text, fontname=_CJK_FONT_NAME, fontfile=_CJK_FONT_PATH, fontsize=size, color=(0, 0, 0)
-        )
-    else:
-        page.insert_text((x, baseline_y), text, fontname="china-s", fontsize=size, color=(0, 0, 0))
+    _draw_run(page, x, baseline_y, text, source_font, size)
+
+
+def _draw_dest_first_line(page: fitz.Page, x: float, top_y: float, fc_code: str, label_line: dict, code_line: dict) -> None:
+    """目的地第一行是"FBA: "接 FC 代码拼出来的，这两段在原文档里经常是不同字体——"FBA: "
+    这个前缀固定是 Helvetica，FC 代码沿用它自己那一行原来的字体（很多时候是宋体）。整行只套
+    一种字体会看着不对：宋体的拉丁字形笔画比 Helvetica 粗，"FBA: "如果套成宋体，看着就会比
+    原文档粗一圈、像是被加粗了。所以这里分两段画，各自沿用自己的原始字体。
+
+    字号统一用 FC 代码那一行的字号，不用标签那一行的——标签那一行原来的字号是因为要塞下很长
+    的发货人名字才被压小的，新内容只有"FBA: <FC代码>"，长度跟原来对不上，沿用会显得偏小。
+    """
+    size = code_line["size"]
+    baseline_y = top_y + size * _BASELINE_RATIO
+    prefix_width = _draw_run(page, x, baseline_y, "FBA: ", label_line["font"], size)
+    _draw_run(page, x + prefix_width, baseline_y, fc_code, code_line["font"], size)
+
+
+_XOBJECT_DO_RE = re.compile(rb"/[A-Za-z0-9#_.\-]+ Do\b")
+
+
+def _reset_text_render_mode_before_xobjects(page: fitz.Page) -> None:
+    """apply_redactions() 内部会重整页面的内容流（clean_contents），实测这一步有时会把
+    箱唛模板里"先切到描边模式画一段白色隐藏水印字、再切回填充模式"这一小段的"切回填充模式"
+    重置操作漏掉——这个没被重置的描边状态会一路泄漏到后面用 Do 调用的内嵌图形对象里（比如
+    条形码下面那行编号，是画在一个 Form XObject 里的），让那行字看着像被加粗了描边一样。这跟
+    我们具体擦了哪块内容、画了什么字都没关系，纯粹是 apply_redactions 自己清理内容流时的副
+    作用（对着完全没加任何擦除框的页面单独调用 clean_contents 也能复现）。
+
+    这里的做法：每次 apply_redactions 之后，在页面内容流里每一处调用 Form/Image XObject 的
+    "Do" 前面强制补一个"0 Tr"（纯填充、不描边）。不管前面泄漏了什么文字渲染模式，调用内嵌
+    图形对象之前先归零——被调用的 XObject 自己内部要画字的话，本来就该自己设置字体/渲染模式
+    （这份箱唛模板确实是这样做的），不会指望从外面继承来的状态，所以补这个重置不会影响正常
+    内容，只会切断本不该泄漏过去的状态。
+    """
+    xrefs = page.get_contents()
+    if not xrefs:
+        return
+    content = page.read_contents()
+    patched = _XOBJECT_DO_RE.sub(lambda m: b"0 Tr " + m.group(0), content)
+    if patched == content:
+        return
+    page.parent.update_stream(xrefs[0], patched)
+    for xref in xrefs[1:]:
+        page.parent.update_stream(xref, b"")
 
 
 def _get_lines(page: fitz.Page) -> list[dict]:
@@ -195,14 +251,12 @@ def redact_page(page: fitz.Page, file_name: str, page_index: int) -> PageResult:
     page.add_redact_annot(origin_rect, fill=(1, 1, 1))
 
     page.apply_redactions()
+    _reset_text_render_mode_before_xobjects(page)
 
     fc_code = dest_lines[1]["text"].strip()
-    # 合并出来的第一行是"FBA: "接 FC 代码，FC 代码那部分原样保留了 dest_lines[1] 的文字，
-    # 字体/字号也跟着用 dest_lines[1] 自己的（两个样本里都是 STSong-Light 8pt，不管前面
-    # 加不加"FBA: "前缀，视觉上都是这一行本来的字体，不用"FBA:"标签那一行缩小过的字号）
-    new_dest = [(f"FBA: {fc_code}", dest_lines[1])] + [(l["text"], l) for l in dest_lines[2:5]]
-    for i, (text, style) in enumerate(new_dest):
-        _draw_line(page, x0, dest_top + i * _LINE_HEIGHT, text, style["font"], style["size"])
+    _draw_dest_first_line(page, x0, dest_top, fc_code, dest_lines[0], dest_lines[1])
+    for i, l in enumerate(dest_lines[2:5]):
+        _draw_line(page, x0, dest_top + (i + 1) * _LINE_HEIGHT, l["text"], l["font"], l["size"])
 
     if country != "加拿大":
         origin_top = origin_lines[0]["bbox"][1]

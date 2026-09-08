@@ -8,3 +8,5 @@ dist/
 config.local.yaml
 data/*
 !data/.gitkeep
+modules/logistics/walmart_shipment_reconcile/vendor/*
+!modules/logistics/walmart_shipment_reconcile/vendor/.gitkeep

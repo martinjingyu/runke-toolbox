@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
+from pathlib import Path
 from typing import Callable
 
 from core.dependency import Dependency
@@ -22,6 +23,10 @@ _WINDOWS_CANDIDATES = [
     r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
 ]
 _INSTALLER_URL = "https://github.com/UB-Mannheim/tesseract/releases/download/v5.4.0.20240606/tesseract-ocr-w64-setup-5.4.0.20240606.exe"
+# 没梯子的话上面这个 GitHub 链接经常下载失败，所以把装好的安装包缓存到 vendor/ 下——
+# 有这个文件就直接用本地的，不用连网；vendor/ 没入 git（见 .gitignore），是每台机器自己
+# 手动放一份的东西，不是仓库的一部分。
+_LOCAL_INSTALLER_PATH = Path(__file__).parent / "vendor" / "tesseract-ocr-w64-setup-5.4.0.20240606.exe"
 
 
 def locate_tesseract() -> str | None:
@@ -41,17 +46,24 @@ def _install(report: Callable[[str], None]) -> None:
     if sys.platform != "win32":
         raise RuntimeError("这台不是 Windows，请手动安装：brew install tesseract（Mac）")
 
-    report("正在下载 Tesseract 安装包……")
-    installer_path = os.path.join(tempfile.gettempdir(), "tesseract-installer.exe")
-    urllib.request.urlretrieve(_INSTALLER_URL, installer_path)
+    if _LOCAL_INSTALLER_PATH.exists():
+        report("使用本地缓存的 Tesseract 安装包……")
+        installer_path = str(_LOCAL_INSTALLER_PATH)
+        cleanup = False
+    else:
+        report("正在下载 Tesseract 安装包……")
+        installer_path = os.path.join(tempfile.gettempdir(), "tesseract-installer.exe")
+        urllib.request.urlretrieve(_INSTALLER_URL, installer_path)
+        cleanup = True
 
     report("正在安装（Windows 可能会跳出授权提示，请点“是”）……")
     subprocess.run([installer_path, "/S"], check=True)
 
-    try:
-        os.remove(installer_path)
-    except OSError:
-        pass
+    if cleanup:
+        try:
+            os.remove(installer_path)
+        except OSError:
+            pass
 
     if locate_tesseract() is None:
         raise RuntimeError("安装完成了，但还是找不到 tesseract.exe——可能是没有管理员权限，安装被跳过了")
