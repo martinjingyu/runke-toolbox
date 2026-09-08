@@ -47,6 +47,12 @@ def _build_purchase_order_import_panel() -> QWidget:
     return PurchaseOrderImportPanel()
 
 
+def _build_warehouse_label_split_panel() -> QWidget:
+    from .warehouse_label_split.panel import WarehouseLabelSplitPanel
+
+    return WarehouseLabelSplitPanel()
+
+
 def build_panel() -> QWidget:
     tools = [
         ToolInfo(
@@ -100,6 +106,16 @@ def build_panel() -> QWidget:
             build_panel=_build_purchase_order_import_panel,
             dependencies=[
                 pip_package("openpyxl", display_name="openpyxl（读写 Excel）"),
+            ],
+        ),
+        ToolInfo(
+            id="warehouse_label_split",
+            name="CA1 入库标签 PDF 拆分",
+            description="按发货计划表里仓库含 CA1、未发货的标签，把一份入库标签 PDF 拆成一个标签一个文件",
+            build_panel=_build_warehouse_label_split_panel,
+            dependencies=[
+                pip_package("pymupdf", import_name="fitz", display_name="PyMuPDF（读取/拆分 PDF）"),
+                pip_package("openpyxl", display_name="openpyxl（读发货计划表）"),
             ],
         ),
     ]
