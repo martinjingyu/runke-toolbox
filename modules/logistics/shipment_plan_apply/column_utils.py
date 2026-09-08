@@ -6,7 +6,9 @@ from __future__ import annotations
 import re
 from copy import copy as copy_style
 
+from openpyxl.cell.cell import Cell, MergedCell
 from openpyxl.utils import column_index_from_string
+from openpyxl.worksheet.formula import ArrayFormula
 from openpyxl.worksheet.worksheet import Worksheet
 
 _CELL_REF_RE = re.compile(r"\b([A-Za-z]{1,3})(\d+)\b")
@@ -113,11 +115,43 @@ def column_index_map(ws: Worksheet, header_row: int) -> dict[str, int]:
     return mapping
 
 
+def all_columns_named(ws: Worksheet, header_row: int, name: str) -> list[int]:
+    """表头文字 -> 所有出现过这个表头文字的列号（1-indexed，按列号顺序）。
+
+    跟 column_index_map 不同，那个只留第一次出现的——大多数字段只在乎"这一列在哪"，重复的
+    表头多半是废弃/历史遗留的列，忽略掉没关系。但像"长/宽/高"这种每一处出现都对应一份真实
+    业务数据的列，如果表里因为历史原因重复出现了不止一次，只处理第一次出现的会漏掉后面那些
+    （比如 purchase_order_import/planner.py 的 _apply_dim_column，需要对每一次出现都单独
+    判断"这一列模板行是不是公式"，不能只按第一次出现的位置来）。
+    """
+    return sorted(cell.column for cell in ws[header_row] if cell.value == name)
+
+
 def require_columns(mapping: dict[str, int], names: list[str], context: str) -> dict[str, int]:
     missing = [n for n in names if n not in mapping]
     if missing:
         raise HeaderNotFoundError(f"{context}缺少必须的表头：{missing}")
     return {n: mapping[n] for n in names}
+
+
+def unmerge_overlapping_rows(ws: Worksheet, min_row: int, max_row: int) -> None:
+    """把所有跟 [min_row, max_row] 这个行区间有重叠的已有合并单元格整个拆开。
+
+    真实表格里常见手工把某一列"提前"合并了一大片还没用到的空白行（比如序号列一路合并到
+    第 1000 行，方便以后陆续往下填）。追加新数据行之前如果不先把这些跟"即将写入的新行"
+    重叠的旧合并区域拆开，新行落进这个区间时，那一格会是 openpyxl 的 MergedCell（合并
+    区域里非左上角的格子）——这种格子连 .value 都赋不了值，会直接抛
+    AttributeError("MergedCell object attribute 'value' is read-only")。这些行马上要被
+    当成一整行独立的新数据来写，本来就不该继续跟一个不相干的旧合并区域绑在一起，拆开是
+    唯一正确的处理方式，不是权宜之计。
+    """
+    to_unmerge = [
+        str(merged_range)
+        for merged_range in ws.merged_cells.ranges
+        if merged_range.min_row <= max_row and merged_range.max_row >= min_row
+    ]
+    for coord in to_unmerge:
+        ws.unmerge_cells(coord)
 
 
 def reindex_formula(formula: str, old_row: int, new_row: int) -> str:
@@ -135,6 +169,51 @@ def reindex_formula(formula: str, old_row: int, new_row: int) -> str:
     return _FORMULA_REF_RE.sub(repl, formula)
 
 
+def is_formula_value(value) -> bool:
+    """判断一个格子读出来的 value 是不是"公式"——不能只看 isinstance(value, str) and
+    value.startswith("=")。Excel 传统的数组公式（Ctrl+Shift+Enter 输入、一次覆盖好几个
+    格子，比如一个 XLOOKUP 返回一整行结果，横着摆满 3 个格子）openpyxl 读出来是
+    ArrayFormula 对象，只有左上角那一格是这个对象，其余被覆盖的格子读出来是普通缓存数字，
+    不是字符串——Excel 里点开这些格子，公式栏会显示这个数组公式的定义（借用左上角那格的），
+    容易让人误以为"这一格自己就是这个公式"，但 openpyxl/文件本身并不是这样存的。
+    """
+    if isinstance(value, str) and value.startswith("="):
+        return True
+    return isinstance(value, ArrayFormula)
+
+
+def reindex_formula_value(value, old_row: int, new_row: int):
+    """跟 reindex_formula 一样"把自引用这一行的单元格引用换成新行号"，但同时支持普通
+    字符串公式和 ArrayFormula——数组公式除了公式原文（.text）以外，它的作用范围
+    （.ref，形如 "AE28497:AG28497"）也是写死的行号，同样要跟着改，不然新行的这个数组
+    公式会覆盖到别的行去。
+    """
+    if isinstance(value, ArrayFormula):
+        return ArrayFormula(
+            ref=reindex_formula(value.ref, old_row, new_row),
+            text=reindex_formula(value.text, old_row, new_row) if value.text else value.text,
+        )
+    return reindex_formula(value, old_row, new_row)
+
+
+def _style_source(ws: Worksheet, cell: Cell) -> Cell:
+    """合并单元格里除了左上角以外的格子，openpyxl 会换成一种叫 MergedCell 的特殊对象——
+    这种格子读不出任何样式（has_style 永远是 False），真正的字体/居中这些格式只存在合并
+    区域左上角那一个格子上。模板行如果恰好是某个合并区域的非左上角行（比如"序号"列纵向
+    合并了好几行的订单，模板行取的是最后一行），直接读它的样式会读到"没有样式"，抄出来的
+    新行就会丢掉字体/居中——这里找到它实际所在的合并区域，换成读左上角格子的样式。
+    """
+    if not isinstance(cell, MergedCell):
+        return cell
+    for merged_range in ws.merged_cells.ranges:
+        if (
+            merged_range.min_row <= cell.row <= merged_range.max_row
+            and merged_range.min_col <= cell.column <= merged_range.max_col
+        ):
+            return ws.cell(row=merged_range.min_row, column=merged_range.min_col)
+    return cell
+
+
 def copy_row(ws: Worksheet, dest_row: int, src_row: int, max_col: int | None = None) -> None:
     """整行复制：值、公式（自引用部分按 src_row -> dest_row 重新指向，见 reindex_formula）、
     格式（字体/填充/边框/对齐/数字格式/保护）、行高都复制过去——用在"接在表格最后一行下面
@@ -149,16 +228,17 @@ def copy_row(ws: Worksheet, dest_row: int, src_row: int, max_col: int | None = N
         src_cell = ws.cell(row=src_row, column=c)
         dest_cell = ws.cell(row=dest_row, column=c)
         value = src_cell.value
-        if isinstance(value, str) and value.startswith("="):
-            value = reindex_formula(value, src_row, dest_row)
+        if is_formula_value(value):
+            value = reindex_formula_value(value, src_row, dest_row)
         dest_cell.value = value
-        if src_cell.has_style:
-            dest_cell.font = copy_style(src_cell.font)
-            dest_cell.fill = copy_style(src_cell.fill)
-            dest_cell.border = copy_style(src_cell.border)
-            dest_cell.alignment = copy_style(src_cell.alignment)
-            dest_cell.number_format = src_cell.number_format
-            dest_cell.protection = copy_style(src_cell.protection)
+        style_cell = _style_source(ws, src_cell)
+        if style_cell.has_style:
+            dest_cell.font = copy_style(style_cell.font)
+            dest_cell.fill = copy_style(style_cell.fill)
+            dest_cell.border = copy_style(style_cell.border)
+            dest_cell.alignment = copy_style(style_cell.alignment)
+            dest_cell.number_format = style_cell.number_format
+            dest_cell.protection = copy_style(style_cell.protection)
     if src_row in ws.row_dimensions:
         ws.row_dimensions[dest_row].height = ws.row_dimensions[src_row].height
 

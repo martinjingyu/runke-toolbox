@@ -23,6 +23,9 @@
 文字整体重新排版折行（"Guangdong - dongguanshi -" 断成两行、跟下一行文字挤在一起），
 这里没有照抄那个折行算法，而是让剩下几行各自成行、往上移——效果是一样的（发货人名字
 不见了），版式更整齐，只是没有做到跟参考例子逐字节一致。
+
+加拿大目的地的 PDF 还有一层额外处理：一个文件里经常汇总了好几个厂商的货，脱敏之后还要
+按每页的 SKU 查出厂商、把同一个厂商的页面拆到单独文件里，见 ca_split.py。
 """
 from __future__ import annotations
 
@@ -31,6 +34,8 @@ from pathlib import Path
 from typing import Callable
 
 import fitz
+
+from .ca_split import VendorLookup, split_ca_pdf
 
 _LINE_HEIGHT = 8.0
 _FONT_SIZE = 8.0
@@ -50,6 +55,7 @@ class PageResult:
 class RunReport:
     results: list[PageResult] = field(default_factory=list)
     output_paths: list[Path] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
     @property
     def modified_count(self) -> int:
@@ -160,6 +166,7 @@ def run(
     input_dir: str | Path,
     output_dir: str | Path,
     progress_callback: Callable[[int, int], None] | None = None,
+    vendor_lookup: VendorLookup | None = None,
 ) -> RunReport:
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
@@ -179,12 +186,28 @@ def run(
 
     for path, page_count in zip(pdf_paths, page_counts):
         doc = fitz.open(path)
+        doc_results = []
         for i in range(page_count):
             result = redact_page(doc[i], path.name, i)
+            doc_results.append(result)
             report.results.append(result)
             done_pages += 1
             if progress_callback is not None:
                 progress_callback(done_pages, total_pages)
+
+        is_ca = any(r.status == "加拿大" for r in doc_results)
+
+        if is_ca and vendor_lookup is not None:
+            split_result = split_ca_pdf(doc, path.name, output_dir, vendor_lookup)
+            if split_result.note is None:
+                report.output_paths.extend(split_result.output_paths)
+                doc.close()
+                continue
+            report.notes.append(split_result.note)
+            # 拆分失败（找不到 SKU/查不到厂商/文件名不符合规则），按原来的合并版输出，不丢文件
+
+        if is_ca and vendor_lookup is None:
+            report.notes.append(f"{path.name}：发往加拿大，汇总了多个厂商的货，但没有提供产品信息表，未按厂商拆分")
 
         out_path = output_dir / path.name
         doc.save(out_path)

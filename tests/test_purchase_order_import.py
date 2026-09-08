@@ -4,6 +4,7 @@ from pathlib import Path
 import openpyxl
 import pytest
 from openpyxl.styles import PatternFill
+from openpyxl.worksheet.formula import ArrayFormula
 from PySide6.QtCore import QSettings
 
 from modules.logistics.purchase_order_import.order_file import OrderFileError, parse_order_file
@@ -353,6 +354,96 @@ def test_apply_plan_appends_rows_to_both_sheets_with_seq_numbering(tmp_path, tab
     assert s_ws.cell(row=7, column=4).fill.fgColor.rgb == s_ws.cell(row=6, column=4).fill.fgColor.rgb
 
 
+def test_apply_plan_copies_seq_column_style_when_template_row_is_a_merged_non_anchor_cell(tmp_path):
+    # 回归测试：如果采购汇总表现有最后一行，恰好是某个多型号订单里"序号"列被纵向合并了的
+    # 非首行（很常见——一个订单好几个型号，序号只写在第一行、其余行合并），openpyxl 会把
+    # 这种非左上角的合并格子变成 MergedCell，读它的样式永远是"没有样式"（has_style 恒为
+    # False）。之前 copy_row() 直接读模板行这一格的样式，读到的就是这种"假的没有样式"，
+    # 抄出来的新行「序号」格子会丢掉字体加粗、居中这些格式。现在应该去读这个合并区域左上角
+    # 那个格子的真实样式。
+    from openpyxl.styles import Alignment, Font
+
+    purchase_path = tmp_path / "purchase.xlsx"
+    summary_path = tmp_path / "summary.xlsx"
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "采购订单汇总"
+    ws.append([None] * 12)
+    ws.append([
+        "序号", "订单号", "采购日期", "交货日期", "供应商名称", "店铺", "型号", "产品名称",
+        "订单数量", "数量单位", "出货日期占位", "未出货数量",
+    ])
+    ws.append([None] * 10 + ["出货时间", None])
+    # 现有订单占了两行（两个型号），序号列纵向合并，值只写在第 4 行（左上角）
+    ws.append([
+        "001", "GH-2501001", dt.datetime(2025, 1, 7), dt.datetime(2025, 3, 17), "GH", None,
+        "TD-OLD-1", "旧型号1", 90, "pcs", None, "=I4",
+    ])
+    ws.append([
+        None, "GH-2501001", dt.datetime(2025, 1, 7), dt.datetime(2025, 3, 17), "GH", None,
+        "TD-OLD-2", "旧型号2", 60, "pcs", None, "=I5",
+    ])
+    ws.cell(row=4, column=1).font = Font(bold=True)
+    ws.cell(row=4, column=1).alignment = Alignment(horizontal="center")
+    ws.merge_cells(start_row=4, start_column=1, end_row=5, end_column=1)
+    wb.save(purchase_path)
+    _write_shipment_summary(summary_path)
+
+    order_folder = tmp_path / "orders"
+    order_folder.mkdir()
+    _write_order_file(
+        order_folder / "order1.xlsx",
+        order_no="GH-2609001",
+        supplier="广东GH工厂",
+        rows=[("TD-RZ-419", "简约花瓶灰色树脂台灯", 90, dt.datetime(2026, 10, 1))],
+    )
+
+    purchase_wb = openpyxl.load_workbook(purchase_path)
+    summary_wb = openpyxl.load_workbook(summary_path)
+    plan = build_plan(order_folder, purchase_wb.active, summary_wb.active, {"广东GH工厂": "GH"})
+    apply_plan(plan, purchase_wb.active, summary_wb.active)
+
+    p_ws = purchase_wb.active
+    # 新行接在第 6 行，模板行取的是第 5 行——那正是上面合并区域里的非左上角行
+    new_seq_cell = p_ws.cell(row=6, column=1)
+    assert new_seq_cell.value == "002"
+    assert new_seq_cell.font.bold is True
+    assert new_seq_cell.alignment.horizontal == "center"
+
+
+def test_apply_plan_unmerges_stray_merge_that_overlaps_new_rows(tmp_path, tables):
+    # 回归测试：真实表格里常见手工把"序号"列提前合并了一大片还没用到的空白行（比如一路
+    # 合并到第 50 行，方便以后陆续往下填）。追加的新行如果正好落进这种旧合并区域，那一格
+    # 会是 openpyxl 的 MergedCell（合并区域里非左上角的格子），直接给它赋值会抛
+    # AttributeError("MergedCell object attribute 'value' is read-only")——之前没处理这种
+    # 情况，现在应该先把跟新行重叠的这部分旧合并拆开，再正常写入。
+    purchase_path, summary_path = tables
+    purchase_wb = openpyxl.load_workbook(purchase_path)
+    p_ws = purchase_wb.active
+    # 现有数据只到第 4 行，"序号"列却提前合并到了第 50 行（跟真实数据没关系，纯粹是提前
+    # 格式化的空白行）
+    p_ws.merge_cells(start_row=4, start_column=1, end_row=50, end_column=1)
+    purchase_wb.save(purchase_path)
+
+    order_folder = tmp_path / "orders"
+    order_folder.mkdir()
+    _write_order_file(
+        order_folder / "order1.xlsx",
+        order_no="GH-2609001",
+        supplier="广东GH工厂",
+        rows=[("TD-RZ-419", "简约花瓶灰色树脂台灯", 90, dt.datetime(2026, 10, 1))],
+    )
+
+    purchase_wb = openpyxl.load_workbook(purchase_path)
+    summary_wb = openpyxl.load_workbook(summary_path)
+    plan = build_plan(order_folder, purchase_wb.active, summary_wb.active, {"广东GH工厂": "GH"})
+    apply_plan(plan, purchase_wb.active, summary_wb.active)  # 不应该抛异常
+
+    p_ws = purchase_wb.active
+    assert p_ws.cell(row=5, column=1).value == "002"
+
+
 def test_apply_plan_preserves_dim_formulas_in_shipment_summary(tmp_path):
     # 发货计划汇总表的最后一行（模板行）「长/宽/高」是公式（跟着箱容自动算），不是写死数字——
     # 新增行应该保留这个公式（自引用部分重指向新行），不能被写死的历史数字覆盖掉。
@@ -397,3 +488,193 @@ def test_apply_plan_preserves_dim_formulas_in_shipment_summary(tmp_path):
     assert s_ws.cell(row=7, column=8).value == "=F7*10"
     assert s_ws.cell(row=7, column=9).value == "=F7*20"
     assert s_ws.cell(row=7, column=10).value == "=F7*30"
+
+
+def test_apply_plan_preserves_dim_formulas_for_duplicate_named_columns(tmp_path):
+    # 回归测试：真实表里出现过"长/宽/高"这几个表头重复出现不止一次（历史遗留的重复列）——
+    # 只处理第一次出现的位置的话，第二次出现那一列会被 copy_row() 原样抄一份模板行当时
+    # 写死的数字，不会跟着箱型自动变化了。这里第二组"长/宽/高"（列 29/30/31）模板行是写死的
+    # 数字，往上一行（第 6 行）才是公式——新行应该往上找到那一行的公式抄一份，不是简单複製
+    # 模板行的写死数字。
+    purchase_path = tmp_path / "purchase.xlsx"
+    summary_path = tmp_path / "summary.xlsx"
+    _write_purchase_summary(purchase_path)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "发货计划"
+    for _ in range(4):
+        ws.append([None] * 31)
+    ws.append([
+        "采购单号", "型号", "标签", "产品名称", "箱数", "箱容", "数量", "长", "宽", "高", "毛重",
+        "CBM", "总材重", "总实重", "仓库", "FBA ID", "追踪编号", "ZD", "编号", "备注", "交货时间",
+        "发货时间", "工厂", "DP", "货代", "出货单号", "状态", "so",
+        "长", "宽", "高",  # 重复出现的第二组长宽高（列 29/30/31）
+    ])
+    ws.append([
+        "GH-2501001", "TD-RZ-000", "=+B6", "旧型号灯饰", 60, 3, "=E6*F6",
+        "=F6*10", "=F6*20", "=F6*30",
+        13.6, None, None, None, "US", "FBA0", "TRACK0", "CA1", None, None, dt.datetime(2025, 1, 1),
+        dt.datetime(2025, 6, 1), "GH", None, "KQ", "SK0", "已发货", None,
+        "=F6*10", "=F6*20", "=F6*30",
+    ])
+    ws.append([
+        "GH-2501009", "TD-RZ-419", "=+B7", "简约花瓶灰色树脂台灯", 60, 3, "=E7*F7",
+        "=F7*10", "=F7*20", "=F7*30",
+        13.6, None, None, None, "US", "FBA1", "TRACK1", "CA1", None, None, dt.datetime(2025, 3, 17),
+        dt.datetime(2026, 1, 7), "GH", None, "KQ", "SK1", "已发货", None,
+        # 模板行（最后一行）的第二组长宽高是历史手填的写死数字，不是公式
+        600, 1200, 1800,
+    ])
+    wb.save(summary_path)
+
+    order_folder = tmp_path / "orders"
+    order_folder.mkdir()
+    _write_order_file(
+        order_folder / "order1.xlsx",
+        order_no="GH-2609001",
+        supplier="广东GH工厂",
+        rows=[("TD-RZ-419", "简约花瓶灰色树脂台灯", 90, dt.datetime(2026, 10, 1))],
+    )
+
+    purchase_wb = openpyxl.load_workbook(purchase_path)
+    summary_wb = openpyxl.load_workbook(summary_path)
+    plan = build_plan(order_folder, purchase_wb.active, summary_wb.active, {"广东GH工厂": "GH"})
+    apply_plan(plan, purchase_wb.active, summary_wb.active)
+
+    s_ws = summary_wb.active
+    # 新行接在第 8 行。第一组长/宽/高（列 8/9/10）模板行本来就是公式，照旧重指向新行。
+    assert s_ws.cell(row=8, column=8).value == "=F8*10"
+    assert s_ws.cell(row=8, column=9).value == "=F8*20"
+    assert s_ws.cell(row=8, column=10).value == "=F8*30"
+    # 第二组长/宽/高（列 29/30/31）模板行是写死数字，应该往上找到第 6 行的公式抄一份、
+    # 重指向新行，而不是被 copy_row() 原样抄一份模板行写死的 600/1200/1800。
+    assert s_ws.cell(row=8, column=29).value == "=F8*10"
+    assert s_ws.cell(row=8, column=30).value == "=F8*20"
+    assert s_ws.cell(row=8, column=31).value == "=F8*30"
+
+
+def test_apply_plan_reindexes_array_formula_for_second_dim_group(tmp_path):
+    # 回归测试：真实表里第二组"长/宽/高"是一个 Excel 传统数组公式（一次 XLOOKUP 覆盖
+    # 长/宽/高三个格子，比如 =XLOOKUP(...,...,$T:$V)）——公式原文只存在"长"这一格
+    # （openpyxl 读出来是 ArrayFormula 对象），"宽"/"高"在文件里读出来只是缓存的普通数字，
+    # 永远不会有公式文本。之前的逻辑把 ArrayFormula 当成"不是公式"，"长"往上找也只会找到
+    # 别的 ArrayFormula（同样不被识别），最后退回写死数字；"宽"/"高"更是天生就没有独立公式
+    # 可找，永远退回写死数字——三列全变成跟第一组长宽高一样的历史写死数字。现在应该正确
+    # 识别 ArrayFormula，把"长"重新指向新行（ref 和公式原文里的自引用都要改），"宽"/"高"
+    # 留空交给 Excel 重新计算。
+    purchase_path = tmp_path / "purchase.xlsx"
+    summary_path = tmp_path / "summary.xlsx"
+    _write_purchase_summary(purchase_path)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "发货计划"
+    for _ in range(4):
+        ws.append([None] * 31)
+    ws.append([
+        "采购单号", "型号", "标签", "产品名称", "箱数", "箱容", "数量", "长", "宽", "高", "毛重",
+        "CBM", "总材重", "总实重", "仓库", "FBA ID", "追踪编号", "ZD", "编号", "备注", "交货时间",
+        "发货时间", "工厂", "DP", "货代", "出货单号", "状态", "so",
+        "长", "宽", "高",  # 重复出现的第二组长宽高（列 29/30/31），真实表里是数组公式
+    ])
+    ws.append([
+        "GH-2501009", "TD-RZ-419", "=+B6", "简约花瓶灰色树脂台灯", 60, 3, "=E6*F6",
+        "=F6*10", "=F6*20", "=F6*30",
+        13.6, None, None, None, "US", "FBA1", "TRACK1", "CA1", None, None, dt.datetime(2025, 3, 17),
+        dt.datetime(2026, 1, 7), "GH", None, "KQ", "SK1", "已发货", None,
+        None, None, None,  # 先占位，下面用 ArrayFormula 单独写"长"这一格
+    ])
+    ws.cell(row=6, column=29, value=ArrayFormula(
+        ref="AC6:AE6",
+        text="=_xlfn.XLOOKUP(W6&B6,[1]在售产品信息总表!$M:$M&[1]在售产品信息总表!$H:$H,[1]在售产品信息总表!$T:$V)",
+    ))
+    ws.cell(row=6, column=30, value=340)  # "宽"：数组公式溢出的缓存数字，不是公式
+    ws.cell(row=6, column=31, value=440)  # "高"：同上
+    wb.save(summary_path)
+
+    order_folder = tmp_path / "orders"
+    order_folder.mkdir()
+    _write_order_file(
+        order_folder / "order1.xlsx",
+        order_no="GH-2609001",
+        supplier="广东GH工厂",
+        rows=[("TD-RZ-419", "简约花瓶灰色树脂台灯", 90, dt.datetime(2026, 10, 1))],
+    )
+
+    purchase_wb = openpyxl.load_workbook(purchase_path)
+    summary_wb = openpyxl.load_workbook(summary_path)
+    plan = build_plan(order_folder, purchase_wb.active, summary_wb.active, {"广东GH工厂": "GH"})
+    apply_plan(plan, purchase_wb.active, summary_wb.active)
+
+    s_ws = summary_wb.active
+    # 新行接在第 7 行。"长"应该还是数组公式，ref 和公式里的自引用都重指向第 7 行。
+    new_length = s_ws.cell(row=7, column=29).value
+    assert isinstance(new_length, ArrayFormula)
+    assert new_length.ref == "AC7:AE7"
+    assert new_length.text == (
+        "=_xlfn.XLOOKUP(W7&B7,[1]在售产品信息总表!$M:$M&[1]在售产品信息总表!$H:$H,"
+        "[1]在售产品信息总表!$T:$V)"
+    )
+    # "宽"/"高"是这个数组公式的溢出结果，不该写死成历史数字（600/1200 那种），留空交给
+    # Excel 打开时自己重新算。
+    assert s_ws.cell(row=7, column=30).value is None
+    assert s_ws.cell(row=7, column=31).value is None
+
+
+def test_apply_plan_ignores_broken_template_row_and_always_uses_first_data_row(tmp_path):
+    # 回归测试：真实表里出现过"长/宽/高"历史上没有统一套用公式——早期数据是手填的写死
+    # 数字，中间某次改版才开始套公式，且中途偶尔会混进个别残缺/异常的行（公式跟别的行对不
+    # 上）。如果按"以当前模板行为准、找不到再往上找最近一行"来处理，一旦最靠近新行的那一行
+    # （模板行本身，或离它最近的一行）刚好是这种异常数据，会悄悄拷贝出错误结果。现在应该
+    # 固定认表格第一条数据行的表达式，不管中间/模板行数据再乱都不受影响。
+    purchase_path = tmp_path / "purchase.xlsx"
+    summary_path = tmp_path / "summary.xlsx"
+    _write_purchase_summary(purchase_path)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "发货计划"
+    for _ in range(4):
+        ws.append([None] * 28)
+    ws.append([
+        "采购单号", "型号", "标签", "产品名称", "箱数", "箱容", "数量", "长", "宽", "高", "毛重",
+        "CBM", "总材重", "总实重", "仓库", "FBA ID", "追踪编号", "ZD", "编号", "备注", "交货时间",
+        "发货时间", "工厂", "DP", "货代", "出货单号", "状态", "so",
+    ])
+    ws.append([
+        "GH-2501001", "TD-RZ-000", "=+B6", "第一条数据行", 60, 3, "=E6*F6",
+        "=F6*10", "=F6*20", "=F6*30",  # 表格第一条数据行——正确的表达式，应该被固定沿用
+        13.6, None, None, None, "US", "FBA0", "TRACK0", "CA1", None, None, dt.datetime(2025, 1, 1),
+        dt.datetime(2025, 6, 1), "GH", None, "KQ", "SK0", "已发货", None,
+    ])
+    ws.append([
+        "GH-2501009", "TD-RZ-419", "=+B7", "简约花瓶灰色树脂台灯", 60, 3, "=E7*F7",
+        # 模板行（最后一行）是残缺/异常数据：只有"长"是公式，"宽"/"高"是明显对不上箱数的
+        # 写死数字（模拟历史上某次手动改坏了这一行）——不应该被拿来当模板
+        "=F7*999", 12345, 67890,
+        13.6, None, None, None, "US", "FBA1", "TRACK1", "CA1", None, None, dt.datetime(2025, 3, 17),
+        dt.datetime(2026, 1, 7), "GH", None, "KQ", "SK1", "已发货", None,
+    ])
+    wb.save(summary_path)
+
+    order_folder = tmp_path / "orders"
+    order_folder.mkdir()
+    _write_order_file(
+        order_folder / "order1.xlsx",
+        order_no="GH-2609001",
+        supplier="广东GH工厂",
+        rows=[("TD-RZ-419", "简约花瓶灰色树脂台灯", 90, dt.datetime(2026, 10, 1))],
+    )
+
+    purchase_wb = openpyxl.load_workbook(purchase_path)
+    summary_wb = openpyxl.load_workbook(summary_path)
+    plan = build_plan(order_folder, purchase_wb.active, summary_wb.active, {"广东GH工厂": "GH"})
+    apply_plan(plan, purchase_wb.active, summary_wb.active)
+
+    s_ws = summary_wb.active
+    # 新行接在第 8 行——长/宽/高应该固定沿用第一条数据行（第 6 行）的表达式，不受模板行
+    # （第 7 行，残缺异常）影响。
+    assert s_ws.cell(row=8, column=8).value == "=F8*10"
+    assert s_ws.cell(row=8, column=9).value == "=F8*20"
+    assert s_ws.cell(row=8, column=10).value == "=F8*30"

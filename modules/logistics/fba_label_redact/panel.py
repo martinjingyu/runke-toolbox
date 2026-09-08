@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .ca_split import load_vendor_lookup
 from .redact import RunReport
 from .redact import run as run_redact
 
@@ -32,17 +33,20 @@ class _RedactWorker(QThread):
     failed = Signal(str)
     progress = Signal(int, int)
 
-    def __init__(self, input_dir: str, output_dir: str):
+    def __init__(self, input_dir: str, output_dir: str, product_table_path: str):
         super().__init__()
         self._input_dir = input_dir
         self._output_dir = output_dir
+        self._product_table_path = product_table_path
 
     def run(self):
         try:
+            vendor_lookup = load_vendor_lookup(self._product_table_path) if self._product_table_path else None
             report = run_redact(
                 self._input_dir,
                 self._output_dir,
                 progress_callback=lambda done, total: self.progress.emit(done, total),
+                vendor_lookup=vendor_lookup,
             )
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -59,6 +63,21 @@ def _dir_picker_row(label_text: str, on_browse) -> tuple[QHBoxLayout, QLineEdit]
     button = QPushButton("浏览…")
     button.clicked.connect(on_browse)
     row.addWidget(button)
+    return row, line_edit
+
+
+def _file_picker_row(label_text: str, on_browse) -> tuple[QHBoxLayout, QLineEdit]:
+    row = QHBoxLayout()
+    row.addWidget(QLabel(label_text))
+    line_edit = QLineEdit()
+    line_edit.setReadOnly(True)
+    row.addWidget(line_edit, 1)
+    button = QPushButton("浏览…")
+    button.clicked.connect(on_browse)
+    row.addWidget(button)
+    clear_button = QPushButton("清除")
+    clear_button.clicked.connect(lambda: line_edit.clear())
+    row.addWidget(clear_button)
     return row, line_edit
 
 
@@ -81,6 +100,13 @@ class FbaLabelRedactPanel(QWidget):
 
         row, self._output_edit = _dir_picker_row("输出目录", self._browse_output)
         inputs_layout.addLayout(row)
+
+        row, self._product_table_edit = _file_picker_row("产品信息表（可选）", self._browse_product_table)
+        inputs_layout.addLayout(row)
+        product_table_hint = QLabel("发往加拿大、汇总了多个厂商的 PDF，需要这张表才能按厂商拆分；不选也能正常脱敏，只是这类 PDF 不会拆分。")
+        product_table_hint.setWordWrap(True)
+        product_table_hint.setStyleSheet("color: gray;")
+        inputs_layout.addWidget(product_table_hint)
 
         layout.addWidget(inputs_box)
 
@@ -118,6 +144,11 @@ class FbaLabelRedactPanel(QWidget):
         if path:
             self._output_edit.setText(path)
 
+    def _browse_product_table(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择产品信息表", "", "Excel 文件 (*.xlsx *.xlsm)")
+        if path:
+            self._product_table_edit.setText(path)
+
     def _start_run(self):
         input_dir = self._input_edit.text().strip()
         output_dir = self._output_edit.text().strip()
@@ -138,7 +169,8 @@ class FbaLabelRedactPanel(QWidget):
         self._status_label.setText("正在处理……")
         self._log.clear()
 
-        self._worker = _RedactWorker(input_dir, output_dir)
+        product_table_path = self._product_table_edit.text().strip()
+        self._worker = _RedactWorker(input_dir, output_dir, product_table_path)
         self._worker.succeeded.connect(self._on_success)
         self._worker.failed.connect(self._on_failure)
         self._worker.progress.connect(self._on_progress)
@@ -162,8 +194,9 @@ class FbaLabelRedactPanel(QWidget):
             f"完成。共 {len(report.results)} 页，{report.modified_count} 页已处理，"
             f"{len(skipped)} 页跳过（需要人工看）。输出了 {len(report.output_paths)} 个文件。"
         )
-        if skipped:
-            lines = [f"{r.file_name} 第 {r.page_index + 1} 页：{r.status}" for r in skipped]
+        lines = [f"{r.file_name} 第 {r.page_index + 1} 页：{r.status}" for r in skipped]
+        lines.extend(report.notes)
+        if lines:
             self._log.setPlainText("\n".join(lines))
 
     def _on_failure(self, message: str):

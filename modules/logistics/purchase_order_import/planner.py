@@ -30,9 +30,18 @@ import datetime as dt
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from openpyxl.worksheet.formula import ArrayFormula
 from openpyxl.worksheet.worksheet import Worksheet
 
-from ..shipment_plan_apply.column_utils import column_index_map, copy_row, reindex_formula, require_columns
+from ..shipment_plan_apply.column_utils import (
+    all_columns_named,
+    column_index_map,
+    copy_row,
+    is_formula_value,
+    reindex_formula_value,
+    require_columns,
+    unmerge_overlapping_rows,
+)
 from ..shipment_plan_apply.purchase_book import PurchaseBook
 from ..shipment_plan_apply.shipment_summary import BLANK_FIELDS, NEW_STATUS, PENDING_LABEL, ShipmentSummaryBook
 from .order_file import OrderFile, OrderFileError, list_order_files, parse_order_file
@@ -249,25 +258,58 @@ def _as_datetime(value: dt.date | None) -> dt.datetime | None:
     return dt.datetime.combine(value, dt.time()) if value is not None else None
 
 
-def _apply_dim_column(
-    ws: Worksheet, col: int, template_row: int, header_row: int, dest_row: int, fallback: float | None
-) -> None:
-    """长/宽/高这几列，发货计划汇总表里有的行是随箱型自动算的公式，有的是历史手填的写死
-    数字——copy_row() 已经把模板行整行（含公式，自引用部分重指向新行）抄给新行了，模板行
-    本身是公式的话这里什么都不用做，直接覆盖反而会把公式换成写死的历史数字，新行就不会再
-    跟着箱型自动算了。只有模板行这一列不是公式时才需要额外处理：往上找最近一行这一列是
-    公式的，把它的公式抄一份过去（同样重指向新行）；再往上也找不到公式，才退回到从同工厂
-    同型号历史记录里查出来的写死数字。
+def _dim_source_row(header_row: int) -> int:
+    # 真实表里出现过"长/宽/高"这几列历史上没有统一套用公式——早期数据是手填的写死数字，
+    # 中间某次改版才开始套公式，且中途偶尔还会混进个别残缺/不完整的异常行（比如公式对不上
+    # 别的行）。与其"以当前表格最后一行为准、找不到再往上找最近一行"（一旦最近的那一行刚好
+    # 是异常数据，会悄悄拷贝出错误结果，很难发现），不如固定认表格第一条数据行——业务方只要
+    # 保证这一行的公式/表达式是对的，新增行就总能拿到正确、统一的结果，不用管中间这段历史
+    # 数据有多混乱。
+    return header_row + 1
+
+
+def _apply_dim_column(ws: Worksheet, col: int, header_row: int, dest_row: int, fallback: float | None) -> None:
+    """长/宽/高这几列，固定按第一条数据行（见 _dim_source_row）这一列的表达式，重新指向
+    新行；第一行这一列如果本身不是公式（比如刚建表还没来得及套），才退回写死数字。
     """
-    template_value = ws.cell(row=template_row, column=col).value
-    if isinstance(template_value, str) and template_value.startswith("="):
+    source_row = _dim_source_row(header_row)
+    value = ws.cell(row=source_row, column=col).value
+    if not is_formula_value(value):
+        _set(ws, dest_row, col, fallback)
         return
-    for r in range(template_row - 1, header_row, -1):
-        v = ws.cell(row=r, column=col).value
-        if isinstance(v, str) and v.startswith("="):
-            _set(ws, dest_row, col, reindex_formula(v, r, dest_row))
-            return
-    _set(ws, dest_row, col, fallback)
+    _set(ws, dest_row, col, reindex_formula_value(value, source_row, dest_row))
+
+
+def _apply_dim_group(
+    ws: Worksheet,
+    length_col: int,
+    width_col: int,
+    height_col: int,
+    header_row: int,
+    dest_row: int,
+    length: float | None,
+    width: float | None,
+    height: float | None,
+) -> None:
+    """真实表里出现过"长"是一个数组公式（比如一次 XLOOKUP 查出长宽高三个值，公式原文只存
+    在"长"这一格，"宽"/"高"在文件里读出来只是缓存的普通数字，永远不会有公式文本，见
+    column_utils.is_formula_value 的说明）——这种情况下"宽"/"高"不能各自独立按
+    _apply_dim_column 处理（不管找哪一行都不会有属于自己的公式，只会一直退回写死数字）。
+    只要第一条数据行这一格解出来是数组公式，"宽"/"高"就是它的溢出结果，不用（也不该）单独
+    写值——Excel 打开重新计算的时候会根据这个数组公式自动算出正确结果；这里主动清空，避免
+    残留旧行的、不会再更新的旧数字长期显示在表里误导人。
+    """
+    source_row = _dim_source_row(header_row)
+    value = ws.cell(row=source_row, column=length_col).value
+    if isinstance(value, ArrayFormula):
+        _set(ws, dest_row, length_col, reindex_formula_value(value, source_row, dest_row))
+        _set(ws, dest_row, width_col, None)
+        _set(ws, dest_row, height_col, None)
+        return
+    # 不是数组公式（普通字符串公式/写死数字/完全没有）——退回原来"三列各自独立处理"的策略
+    _apply_dim_column(ws, length_col, header_row, dest_row, length)
+    _apply_dim_column(ws, width_col, header_row, dest_row, width)
+    _apply_dim_column(ws, height_col, header_row, dest_row, height)
 
 
 def _set(ws: Worksheet, row: int, col: int, value) -> None:
@@ -309,6 +351,14 @@ def apply_plan(plan: Plan, purchase_ws: Worksheet, summary_ws: Worksheet) -> Non
 
     p_template_row = p_last_row
     s_template_row = s_last_row
+
+    # 真实表格里常见手工把某一列"提前"合并了一大片还没用到的空白行（比如序号列一路合并到
+    # 很靠后的行）——即将追加的新行如果正好落进这种旧合并区域，openpyxl 会把对应格子当成
+    # MergedCell，连值都赋不了。这两张表接下来各要新增 len(plan.items) 行，先把这个范围内
+    # 任何跟它有重叠的旧合并区域拆开，保证下面 copy_row()/_set() 能正常写值；不影响这个
+    # 范围之外的合并（比如已有数据里正常的、同一订单多型号共用一个序号的合并）。
+    unmerge_overlapping_rows(purchase_ws, p_last_row + 1, p_last_row + len(plan.items))
+    unmerge_overlapping_rows(summary_ws, s_last_row + 1, s_last_row + len(plan.items))
 
     # 采购汇总表「数量单位」和「未出货数量」之间那一大片是各批次的已出货数量——这些是模板行
     # 自己的出货历史，新订单还没发过货，这些格子照抄过来的话会凭空多出一堆假的已出货记录，
@@ -354,9 +404,26 @@ def apply_plan(plan: Plan, purchase_ws: Worksheet, summary_ws: Worksheet) -> Non
         _set(summary_ws, s_row, s_cols["产品名称"], item.product_name)
         _set(summary_ws, s_row, s_cols["箱数"], item.boxes)
         _set(summary_ws, s_row, s_cols["箱容"], item.box_capacity)
-        _apply_dim_column(summary_ws, s_cols["长"], s_template_row, summary_book.header_row, s_row, item.length)
-        _apply_dim_column(summary_ws, s_cols["宽"], s_template_row, summary_book.header_row, s_row, item.width)
-        _apply_dim_column(summary_ws, s_cols["高"], s_template_row, summary_book.header_row, s_row, item.height)
+        # "长/宽/高"这几列，真实表里出现过同一个表头名字重复出现不止一次的情况（历史遗留的
+        # 重复列，比如后来又加了一组通过 XLOOKUP 从产品信息表查出来的"长/宽/高"）——s_cols
+        # 只留了第一次出现的位置，这里改成对每一组出现都单独处理，不能只处理第一组。三个
+        # 名字按左到右的顺序一一配对成组（zip），因为"长/宽/高"是一起出现的，同一组的三个
+        # 数字应该一起处理（尤其是一整组由同一个数组公式算出来的情况，见 _apply_dim_group）。
+        length_cols = all_columns_named(summary_ws, summary_book.header_row, "长")
+        width_cols = all_columns_named(summary_ws, summary_book.header_row, "宽")
+        height_cols = all_columns_named(summary_ws, summary_book.header_row, "高")
+        for length_col, width_col, height_col in zip(length_cols, width_cols, height_cols):
+            _apply_dim_group(
+                summary_ws,
+                length_col,
+                width_col,
+                height_col,
+                summary_book.header_row,
+                s_row,
+                item.length,
+                item.width,
+                item.height,
+            )
         _set(summary_ws, s_row, s_cols["毛重"], item.gross_weight)
         _set(summary_ws, s_row, s_cols["交货时间"], _as_datetime(item.delivery_date))
         _set(summary_ws, s_row, s_cols["发货时间"], PENDING_LABEL)
