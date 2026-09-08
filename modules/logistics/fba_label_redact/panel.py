@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from .ca_split import load_vendor_lookup
-from .redact import RunReport
+from .redact import FBA_DIR_NAME, RunReport
 from .redact import run as run_redact
 
 
@@ -33,10 +33,9 @@ class _RedactWorker(QThread):
     failed = Signal(str)
     progress = Signal(int, int)
 
-    def __init__(self, input_dir: str, output_dir: str, product_table_path: str):
+    def __init__(self, input_dir: str, product_table_path: str):
         super().__init__()
         self._input_dir = input_dir
-        self._output_dir = output_dir
         self._product_table_path = product_table_path
 
     def run(self):
@@ -44,7 +43,6 @@ class _RedactWorker(QThread):
             vendor_lookup = load_vendor_lookup(self._product_table_path) if self._product_table_path else None
             report = run_redact(
                 self._input_dir,
-                self._output_dir,
                 progress_callback=lambda done, total: self.progress.emit(done, total),
                 vendor_lookup=vendor_lookup,
             )
@@ -85,6 +83,7 @@ class FbaLabelRedactPanel(QWidget):
     def __init__(self):
         super().__init__()
         self._worker: _RedactWorker | None = None
+        self._output_dir: str = ""
 
         layout = QVBoxLayout(self)
 
@@ -98,15 +97,19 @@ class FbaLabelRedactPanel(QWidget):
         row, self._input_edit = _dir_picker_row("箱唛 PDF 所在目录", self._browse_input)
         inputs_layout.addLayout(row)
 
-        row, self._output_edit = _dir_picker_row("输出目录", self._browse_output)
-        inputs_layout.addLayout(row)
-
         row, self._product_table_edit = _file_picker_row("产品信息表（可选）", self._browse_product_table)
         inputs_layout.addLayout(row)
         product_table_hint = QLabel("发往加拿大、汇总了多个厂商的 PDF，需要这张表才能按厂商拆分；不选也能正常脱敏，只是这类 PDF 不会拆分。")
         product_table_hint.setWordWrap(True)
         product_table_hint.setStyleSheet("color: gray;")
         inputs_layout.addWidget(product_table_hint)
+
+        output_hint = QLabel(
+            "不用另外选输出目录：脱敏完的文件统一存到输入目录下新建的「FBA」文件夹里。"
+        )
+        output_hint.setWordWrap(True)
+        output_hint.setStyleSheet("color: gray;")
+        inputs_layout.addWidget(output_hint)
 
         layout.addWidget(inputs_box)
 
@@ -139,11 +142,6 @@ class FbaLabelRedactPanel(QWidget):
         if path:
             self._input_edit.setText(path)
 
-    def _browse_output(self):
-        path = QFileDialog.getExistingDirectory(self, "选择输出目录")
-        if path:
-            self._output_edit.setText(path)
-
     def _browse_product_table(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择产品信息表", "", "Excel 文件 (*.xlsx *.xlsm)")
         if path:
@@ -151,15 +149,9 @@ class FbaLabelRedactPanel(QWidget):
 
     def _start_run(self):
         input_dir = self._input_edit.text().strip()
-        output_dir = self._output_edit.text().strip()
 
-        missing = []
         if not input_dir:
-            missing.append("箱唛 PDF 所在目录")
-        if not output_dir:
-            missing.append("输出目录")
-        if missing:
-            QMessageBox.warning(self, "缺少输入", "还没选：" + "、".join(missing))
+            QMessageBox.warning(self, "缺少输入", "还没选：箱唛 PDF 所在目录")
             return
 
         self._run_button.setEnabled(False)
@@ -169,8 +161,9 @@ class FbaLabelRedactPanel(QWidget):
         self._status_label.setText("正在处理……")
         self._log.clear()
 
+        self._output_dir = str(Path(input_dir) / FBA_DIR_NAME)
         product_table_path = self._product_table_edit.text().strip()
-        self._worker = _RedactWorker(input_dir, output_dir, product_table_path)
+        self._worker = _RedactWorker(input_dir, product_table_path)
         self._worker.succeeded.connect(self._on_success)
         self._worker.failed.connect(self._on_failure)
         self._worker.progress.connect(self._on_progress)
@@ -206,9 +199,8 @@ class FbaLabelRedactPanel(QWidget):
         QMessageBox.critical(self, "处理失败", message)
 
     def _open_output_folder(self):
-        output_dir = self._output_edit.text().strip()
-        if output_dir:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(output_dir))
+        if self._output_dir:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._output_dir))
 
     def stop_running_tasks(self):
         # 这个工具处理很快（没有条码解码/OCR），关软件时就算有任务在跑，等它自然跑完

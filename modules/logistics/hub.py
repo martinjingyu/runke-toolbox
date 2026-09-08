@@ -61,6 +61,12 @@ def _build_cg_label_split_panel() -> QWidget:
     return LabelSplitPanel("CG 入库标签 PDF 拆分", "CG-TS-MD.pdf", parse_label_pdf)
 
 
+def _build_lowm_label_split_panel() -> QWidget:
+    from .warehouse_label_split.lowm_panel import LowmSplitPanel
+
+    return LowmSplitPanel()
+
+
 def build_panel() -> QWidget:
     tools = [
         ToolInfo(
@@ -131,6 +137,16 @@ def build_panel() -> QWidget:
             name="CG 入库标签 PDF 拆分",
             description="按发货计划表里仓库含 CG、未发货的标签，把一份入库标签 PDF 拆成一个标签一个文件",
             build_panel=_build_cg_label_split_panel,
+            dependencies=[
+                pip_package("pymupdf", import_name="fitz", display_name="PyMuPDF（读取/拆分 PDF）"),
+                pip_package("openpyxl", display_name="openpyxl（读发货计划表）"),
+            ],
+        ),
+        ToolInfo(
+            id="lowm_label_split",
+            name="LO-WM 箱唛 PDF 拆分",
+            description="不认 SKU，按发货计划表里未发货的箱数汇总，直接按页把 Walmart 站点箱唛 PDF 分给各厂商",
+            build_panel=_build_lowm_label_split_panel,
             dependencies=[
                 pip_package("pymupdf", import_name="fitz", display_name="PyMuPDF（读取/拆分 PDF）"),
                 pip_package("openpyxl", display_name="openpyxl（读发货计划表）"),

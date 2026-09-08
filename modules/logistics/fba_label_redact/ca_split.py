@@ -116,6 +116,43 @@ def split_vendor_prefix(file_name: str) -> tuple[list[str], str] | None:
     return None
 
 
+def extract_warehouse_code(rest: str) -> str | None:
+    """rest 是 split_vendor_prefix 拆出来的"从日期段开始的部分"，形如"9.9-CLT2 FBA19NW5LTHC
+     NK.pdf"（美国）或"9.9-CA-YYC4 FBA19NVYQBMT.pdf"（加拿大，日期段后面多一段"CA"国家
+    标记）。目的地仓库/FC 代号紧跟在日期段（美国）或"CA"标记（加拿大）后面，取空格之前的那
+    一段——命名习惯里这几段都是用"-"连接、FC 代号后面用空格接单号/其它文字。取不出来（结构
+    跟预期不符，比如日期段后面没东西了）返回 None，交给调用方决定怎么处理，不硬猜。
+    """
+    parts = rest.split("-")
+    if len(parts) < 2:
+        return None
+    idx = 1
+    if parts[idx].strip() == "CA":
+        idx += 1
+    if idx >= len(parts):
+        return None
+    tokens = parts[idx].split()
+    return tokens[0] if tokens else None
+
+
+def resolve_vendor_and_warehouse(file_name: str) -> tuple[str, str] | None:
+    """从文件名（还没拆分过的原始文件名，或者已经拆成单厂商的文件名都行）里识别出唯一的
+    厂商代号和目的地仓库/FC 代号——给"按厂商+仓库分文件夹"用。文件名里的厂商代号不止一个
+    （比如"GH-WJ-..."这种还没按厂商拆开的加拿大汇总文件），或者压根找不到日期分段/仓库代号，
+    都返回 None，不硬选一个，交给调用方决定怎么兜底（不分类，原样放在顶层目录）。
+    """
+    prefix = split_vendor_prefix(file_name)
+    if prefix is None:
+        return None
+    vendors, rest = prefix
+    if len(vendors) != 1:
+        return None
+    warehouse = extract_warehouse_code(rest)
+    if warehouse is None:
+        return None
+    return vendors[0], warehouse
+
+
 def extract_pages(src: fitz.Document, page_indices: list[int]) -> fitz.Document:
     new_doc = fitz.open()
     for idx in page_indices:
@@ -130,6 +167,10 @@ class CaSplitResult:
 
 
 def split_ca_pdf(doc: fitz.Document, file_name: str, output_dir: Path, vendor_lookup: VendorLookup) -> CaSplitResult:
+    # 曾经试过让调用方传 resolve_output_dir(vendor, warehouse) -> Path，把每个厂商的拆分
+    # 结果分别存到各自的"厂商/仓库"文件夹里——先改回最简单的"都存到同一个 output_dir"，
+    # 想恢复按厂商/仓库分文件夹的话，参考 resolve_vendor_and_warehouse/extract_warehouse_code
+    # 这两个函数（还留着，没删）。
     prefix = split_vendor_prefix(file_name)
     if prefix is None:
         return CaSplitResult([], f"{file_name}：文件名里找不到日期分段，无法确定厂商代号和其余部分的分界，未拆分")
@@ -172,6 +213,8 @@ def split_ca_pdf(doc: fitz.Document, file_name: str, output_dir: Path, vendor_lo
     output_paths: list[Path] = []
     for vendor, indices in groups.items():
         new_doc = extract_pages(doc, indices)
+        # 都存到同一个 output_dir，文件名带上厂商前缀区分，不然不同厂商拆出来的文件名会撞车
+        # （拆分之前只有一份 rest，同一份原文件拆出的每个厂商版本 rest 都一样）
         out_path = output_dir / f"{vendor}-{rest}"
         new_doc.save(out_path)
         new_doc.close()

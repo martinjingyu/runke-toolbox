@@ -40,6 +40,10 @@
 
 加拿大目的地的 PDF 还有一层额外处理：一个文件里经常汇总了好几个厂商的货，脱敏之后还要
 按每页的 SKU 查出厂商、把同一个厂商的页面拆到单独文件里，见 ca_split.py。
+
+输出不再要求指定一个统一的输出目录：脱敏完的文件统一放进输入目录下新建的"FBA"文件夹里
+（之前试过按"厂商代号/仓库代号"两层文件夹自动归类，先注释掉暂不用，见下面
+_resolve_output_dir_by_vendor_warehouse，想恢复的话把 run() 里调用它的那段取消注释）。
 """
 from __future__ import annotations
 
@@ -51,7 +55,10 @@ from typing import Callable
 
 import fitz
 
-from .ca_split import VendorLookup, split_ca_pdf
+from .ca_split import VendorLookup, resolve_vendor_and_warehouse, split_ca_pdf
+
+FBA_DIR_NAME = "FBA"
+UNSORTED_DIR_NAME = "未分类"  # 暂时没用到——之前按厂商/仓库分文件夹时，解析不出来的文件才会用它
 
 _LINE_HEIGHT = 8.0
 _BASELINE_RATIO = 6.5 / 8.0  # insert_text 的落点是文字基线，这个比例是从行框顶部换算成基线用的
@@ -268,13 +275,18 @@ def redact_page(page: fitz.Page, file_name: str, page_index: int) -> PageResult:
 
 def run(
     input_dir: str | Path,
-    output_dir: str | Path,
     progress_callback: Callable[[int, int], None] | None = None,
     vendor_lookup: VendorLookup | None = None,
 ) -> RunReport:
     input_dir = Path(input_dir)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 按厂商/仓库分文件夹的版本先注释掉，暂时全部放到同一个 FBA 文件夹里（想恢复就把这段
+    # 取消注释，再把下面 out_dir = input_dir / FBA_DIR_NAME 那行换回用 resolve_output_dir）：
+    #
+    # def resolve_output_dir(vendor: str, warehouse: str) -> Path:
+    #     return input_dir / vendor / warehouse
+    out_dir = input_dir / FBA_DIR_NAME
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     pdf_paths = find_pdfs(input_dir)
     total_pages = 0
@@ -302,7 +314,7 @@ def run(
         is_ca = any(r.status == "加拿大" for r in doc_results)
 
         if is_ca and vendor_lookup is not None:
-            split_result = split_ca_pdf(doc, path.name, output_dir, vendor_lookup)
+            split_result = split_ca_pdf(doc, path.name, out_dir, vendor_lookup)
             if split_result.note is None:
                 report.output_paths.extend(split_result.output_paths)
                 doc.close()
@@ -313,7 +325,18 @@ def run(
         if is_ca and vendor_lookup is None:
             report.notes.append(f"{path.name}：发往加拿大，汇总了多个厂商的货，但没有提供产品信息表，未按厂商拆分")
 
-        out_path = output_dir / path.name
+        # 按厂商/仓库分文件夹的版本先注释掉（见上面 run() 开头的说明），暂时都存到 out_dir：
+        #
+        # vendor_warehouse = resolve_vendor_and_warehouse(path.name)
+        # if vendor_warehouse is not None:
+        #     vendor, warehouse = vendor_warehouse
+        #     out_dir = resolve_output_dir(vendor, warehouse)
+        # else:
+        #     report.notes.append(f"{path.name}：文件名结构不符合预期，识别不出厂商/仓库，放进了「{UNSORTED_DIR_NAME}」文件夹，需要人工归类")
+        #     out_dir = input_dir / UNSORTED_DIR_NAME
+        # out_dir.mkdir(parents=True, exist_ok=True)
+
+        out_path = out_dir / path.name
         doc.save(out_path)
         doc.close()
         report.output_paths.append(out_path)

@@ -2,9 +2,10 @@
 发货计划表里逐个核对——只查这些标签，不读发货计划表里其它几万行跟这份 PDF 无关的历史数据
 （那些标签根本不在这份 PDF 里，读出来也没用，还会在报告里制造一堆无关的噪音）。核对到「仓库
 含站点代号、状态=未发货」的记录（不要求发货时间=待定，已经安排了具体发货日期但还没实际发出
-去的也算），就把对应的箱子页面从标签 PDF 里抽出来，按"厂商代号 标签 箱数合计箱.pdf"命名
-（三段之间用空格隔开，比如"GH TD-243 10箱.pdf"），存到标签 PDF 所在目录下新建的 output
-子文件夹。
+去的也算），就把对应的箱子页面从标签 PDF 里抽出来，存到标签 PDF 所在目录下新建的
+"厂商代号/站点代号"两层子文件夹（比如"GH/CA1"），文件名按"标签 箱数合计箱.pdf"命名（比如
+"TD-243 10箱.pdf"）——厂商已经体现在文件夹名字里了，文件名不用重复写一遍。不同厂商的标签
+分到不同的厂商文件夹，同一个厂商的多个标签落进同一个厂商文件夹下面同一个站点子文件夹。
 
 站点代号（拿去筛发货计划表「仓库」列的关键字）不写死，从标签 PDF 的文件名推导：取文件名
 （不含扩展名）里第一个"-"之前的部分，没有"-"就用整个文件名——"CA1.pdf"和"CA1-XXX.pdf"都
@@ -34,8 +35,6 @@ import fitz
 from .box import Box, LabelPdfStructureError
 from .shipping_plan import load_pending_groups
 
-OUTPUT_DIR_NAME = "output"
-
 ParseBoxesFn = Callable[[fitz.Document], list[Box]]
 
 
@@ -62,7 +61,6 @@ def derive_warehouse_code(label_pdf_path: str | Path) -> str:
 
 def run(label_pdf_path: str | Path, shipping_plan_path: str | Path, parse_boxes: ParseBoxesFn) -> SplitReport:
     label_pdf_path = Path(label_pdf_path)
-    output_dir = label_pdf_path.parent / OUTPUT_DIR_NAME
     warehouse_code = derive_warehouse_code(label_pdf_path)
 
     doc = fitz.open(label_pdf_path)
@@ -91,8 +89,6 @@ def run(label_pdf_path: str | Path, shipping_plan_path: str | Path, parse_boxes:
             report.notes.append(f"「{label}」：发货计划表里匹配到的待发行「工厂」不一致（{'、'.join(factories)}），跳过，需要人工核对")
 
         matched_labels = sorted(pending.groups)
-        if matched_labels:
-            output_dir.mkdir(parents=True, exist_ok=True)
 
         for label in matched_labels:
             group = pending.groups[label]
@@ -105,9 +101,12 @@ def run(label_pdf_path: str | Path, shipping_plan_path: str | Path, parse_boxes:
                 for p in pages:
                     out_doc.insert_pdf(doc, from_page=p, to_page=p)
 
+            out_dir = label_pdf_path.parent / _sanitize(group.factory) / _sanitize(warehouse_code)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
             boxes_text = str(group.total_boxes) if group.boxes_exact else f"{group.total_boxes:.1f}"
-            out_name = f"{_sanitize(group.factory)} {_sanitize(label)} {boxes_text}箱.pdf"
-            out_path = output_dir / out_name
+            out_name = f"{_sanitize(label)} {boxes_text}箱.pdf"
+            out_path = out_dir / out_name
             out_doc.save(out_path)
             out_doc.close()
 

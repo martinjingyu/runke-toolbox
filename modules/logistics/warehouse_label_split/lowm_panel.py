@@ -1,11 +1,8 @@
-"""入库标签 PDF 拆分——这个工具自己的界面。
+"""LO-WM（Walmart）站点箱唛 PDF 拆分——这个工具自己的界面。
 
-不同站点的标签 PDF 版式不一样（见 splitter.py 里 parse_boxes 的说明），但界面和交互是
-通用的，所以做成一个可以传参数复用的面板类，每个站点在 hub.py 里各自 new 一个实例，传各自
-的标题、示例文件名提示、解析函数。
-
-跟 fba_label_redact 一样是纯文本/PDF 拼页操作，没有条码解码、没有 OCR，实测很快，放后台
-线程跑但不需要进度条/协作式取消。
+跟 CA1/CG 拆分工具用的是同一套 _file_picker_row 之类的小组件（见 panel.py），但核心逻辑
+（lowm_splitter.run）不需要认 SKU，报告的形状也不一样（按厂商汇总，不是按标签），所以单独
+写一个面板类，不硬塞进 LabelSplitPanel 里。
 """
 from __future__ import annotations
 
@@ -26,70 +23,55 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .splitter import ParseBoxesFn, SplitReport
-from .splitter import run as run_split
+from .lowm_splitter import LowmSplitReport
+from .lowm_splitter import run as run_lowm_split
+from .panel import _file_picker_row
 
 
-class _SplitWorker(QThread):
-    succeeded = Signal(object)  # SplitReport
+class _LowmSplitWorker(QThread):
+    succeeded = Signal(object)  # LowmSplitReport
     failed = Signal(str)
 
-    def __init__(self, label_pdf_path: str, shipping_plan_path: str, parse_boxes: ParseBoxesFn):
+    def __init__(self, label_pdf_path: str, shipping_plan_path: str):
         super().__init__()
         self._label_pdf_path = label_pdf_path
         self._shipping_plan_path = shipping_plan_path
-        self._parse_boxes = parse_boxes
 
     def run(self):
         try:
-            report = run_split(self._label_pdf_path, self._shipping_plan_path, self._parse_boxes)
+            report = run_lowm_split(self._label_pdf_path, self._shipping_plan_path)
         except Exception as exc:
             self.failed.emit(str(exc))
             return
         self.succeeded.emit(report)
 
 
-def _file_picker_row(label_text: str, filter_text: str, on_pick) -> tuple[QHBoxLayout, QLineEdit]:
-    # 不设 setReadOnly(True)——很多时候路径是从别处（比如资源管理器地址栏、聊天记录）复制来的，
-    # 直接粘贴到输入框比每次都弹文件选择框方便，所以这里允许手动输入/粘贴，「浏览…」按钮只是
-    # 另一种更省事的填法，不是唯一填法。
-    row = QHBoxLayout()
-    row.addWidget(QLabel(label_text))
-    line_edit = QLineEdit()
-    row.addWidget(line_edit, 1)
-    button = QPushButton("浏览…")
-    button.clicked.connect(lambda: on_pick(line_edit))
-    row.addWidget(button)
-    return row, line_edit
-
-
-class LabelSplitPanel(QWidget):
-    def __init__(self, title: str, example_file_name: str, parse_boxes: ParseBoxesFn):
+class LowmSplitPanel(QWidget):
+    def __init__(self):
         super().__init__()
-        self._parse_boxes = parse_boxes
-        self._worker: _SplitWorker | None = None
+        self._worker: _LowmSplitWorker | None = None
         self._output_dir: Path | None = None
 
         layout = QVBoxLayout(self)
 
-        title_label = QLabel(title)
+        title_label = QLabel("LO-WM（Walmart）箱唛 PDF 拆分")
         title_label.setStyleSheet("font-size: 16px; font-weight: bold;")
         layout.addWidget(title_label)
 
         inputs_box = QGroupBox("输入")
         inputs_layout = QVBoxLayout(inputs_box)
 
-        row, self._label_pdf_edit = _file_picker_row(f"入库标签 PDF（比如 {example_file_name}）", "PDF 文件 (*.pdf)", self._browse_label_pdf)
+        row, self._label_pdf_edit = _file_picker_row("站点箱唛 PDF（比如 DFW5s.pdf）", "PDF 文件 (*.pdf)", self._browse_label_pdf)
         inputs_layout.addLayout(row)
 
         row, self._plan_edit = _file_picker_row("发货计划表", "Excel 文件 (*.xlsx *.xlsm)", self._browse_plan)
         inputs_layout.addLayout(row)
 
         hint = QLabel(
-            "站点代号取自入库标签 PDF 的文件名（第一个「-」之前的部分）。"
-            "按发货计划表里「仓库含这个站点代号、状态=未发货」的标签，从入库标签 PDF 里抽出对应箱子的页面，"
-            "在标签 PDF 所在目录下按「厂商代号/站点代号」新建两层文件夹（比如「GH/CA1」），"
-            "文件按「标签 箱数合计箱.pdf」命名，存到对应的文件夹里。"
+            "站点代号取自箱唛 PDF 的文件名（第一个「-」之前的部分）。"
+            "不需要认 SKU：按发货计划表里「仓库含这个站点代号、状态=未发货」的记录按厂商汇总箱数，"
+            "直接按顺序切页给各厂商，在箱唛 PDF 所在目录下按「厂商代号/站点代号」新建两层文件夹（比如「GH/DFW5s」），"
+            "文件按「厂商代号 站点代号 箱数箱.pdf」命名。"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: gray;")
@@ -114,11 +96,11 @@ class LabelSplitPanel(QWidget):
 
         self._log = QPlainTextEdit()
         self._log.setReadOnly(True)
-        self._log.setPlaceholderText("拆分结果和需要人工看一下的标签（比如两边对不上、工厂不一致）会列在这里。")
+        self._log.setPlaceholderText("拆分结果和需要人工看一下的提示（比如页数不够、箱数没对齐）会列在这里。")
         layout.addWidget(self._log, 1)
 
     def _browse_label_pdf(self, line_edit: QLineEdit):
-        path, _ = QFileDialog.getOpenFileName(self, "选择入库标签 PDF", "", "PDF 文件 (*.pdf)")
+        path, _ = QFileDialog.getOpenFileName(self, "选择站点箱唛 PDF", "", "PDF 文件 (*.pdf)")
         if path:
             line_edit.setText(path)
 
@@ -133,7 +115,7 @@ class LabelSplitPanel(QWidget):
 
         missing = []
         if not label_pdf_path:
-            missing.append("入库标签 PDF")
+            missing.append("站点箱唛 PDF")
         if not plan_path:
             missing.append("发货计划表")
         if missing:
@@ -145,23 +127,21 @@ class LabelSplitPanel(QWidget):
         self._status_label.setText("正在处理……")
         self._log.clear()
 
-        # 拆出来的文件按厂商各分到一个新文件夹（比如「GH CA1」），都建在标签 PDF 所在目录下——
-        # 打开这个目录就能看到本次新建的所有厂商文件夹，不用逐个记文件夹名字
         self._output_dir = Path(label_pdf_path).parent
-        self._worker = _SplitWorker(label_pdf_path, plan_path, self._parse_boxes)
+        self._worker = _LowmSplitWorker(label_pdf_path, plan_path)
         self._worker.succeeded.connect(self._on_success)
         self._worker.failed.connect(self._on_failure)
         self._worker.start()
 
-    def _on_success(self, report: SplitReport):
+    def _on_success(self, report: LowmSplitReport):
         self._run_button.setEnabled(True)
         self._open_output_button.setEnabled(bool(report.outputs))
 
-        self._status_label.setText(f"完成。拆出了 {len(report.outputs)} 个文件，{len(report.notes)} 条需要人工看一下的提示。")
+        self._status_label.setText(f"完成。拆出了 {len(report.outputs)} 个厂商的文件，{len(report.notes)} 条需要人工看一下的提示。")
 
         lines = [
-            f"{o.output_path.parent.parent.name}/{o.output_path.parent.name}/{o.output_path.name}：{o.box_count} 个箱子"
-            for o in sorted(report.outputs, key=lambda o: o.label)
+            f"{o.output_path.parent.parent.name}/{o.output_path.parent.name}/{o.output_path.name}"
+            for o in sorted(report.outputs, key=lambda o: o.factory)
         ]
         if report.notes:
             lines.append("")

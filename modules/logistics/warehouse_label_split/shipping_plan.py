@@ -30,6 +30,7 @@ import openpyxl
 from ..shipment_plan_apply.column_utils import column_index_map, find_header_row, require_columns
 
 REQUIRED_HEADERS = ["标签", "状态", "箱数", "工厂", "仓库"]
+REQUIRED_HEADERS_BY_FACTORY = ["状态", "箱数", "工厂", "仓库"]
 
 PENDING_STATUS = "未发货"
 
@@ -108,3 +109,36 @@ def load_pending_groups(
             row_count=counts[label],
         )
     return result
+
+
+def load_pending_boxes_by_factory(
+    xlsx_path: str | Path, warehouse_code: str, sheet_name: str | None = None
+) -> dict[str, float]:
+    """跟 load_pending_groups 一样按「仓库含 warehouse_code + 状态=未发货」筛选，但不看
+    「标签」，直接按「工厂」把「箱数」加总——给 lowm_splitter.py 用：LO-WM 站点的箱唛 PDF
+    不需要认每一页具体是哪个 SKU（Walmart 只在乎这一批货的总箱数，不在乎每箱具体装的是什么，
+    见 lowm_splitter.py 顶部说明），只要知道"这个厂商这次一共要发多少箱"就够了。
+    """
+    wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
+    ws = wb[sheet_name] if sheet_name else wb[wb.sheetnames[0]]
+
+    header_row = find_header_row(ws, REQUIRED_HEADERS_BY_FACTORY, max_scan_rows=10)
+    cols = column_index_map(ws, header_row)
+    idx = require_columns(cols, REQUIRED_HEADERS_BY_FACTORY, "发货计划表")
+
+    totals: dict[str, float] = {}
+    for row in ws.iter_rows(min_row=header_row + 1):
+        status = row[idx["状态"] - 1].value
+        if status != PENDING_STATUS:
+            continue
+
+        warehouse = row[idx["仓库"] - 1].value
+        if warehouse is None or warehouse_code not in str(warehouse):
+            continue
+
+        factory = row[idx["工厂"] - 1].value
+        factory = str(factory).strip() if factory is not None else ""
+        boxes_value = row[idx["箱数"] - 1].value
+
+        totals[factory] = totals.get(factory, 0.0) + _num(boxes_value)
+    return totals
