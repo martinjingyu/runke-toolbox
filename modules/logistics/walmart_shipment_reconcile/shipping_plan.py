@@ -27,6 +27,7 @@ class ShippingPlanRow:
     warehouse_code: str | None  # 归一化后的仓库代码，比如 "US(IND3)" -> "IND3"；识别不出来是 None
     tracking_id: str  # "追踪编号"，对应箱唛上的 SHIPMENT ID
     planned_quantity: int
+    factory: str  # "工厂"列，原始写法；表里没有这一列或单元格是空的话就是 ""
 
 
 def normalize_warehouse(value) -> str | None:
@@ -52,6 +53,7 @@ def parse_shipping_plan(xlsx_path: str | Path, sheet_name: str | None = None) ->
     rows = list(ws.iter_rows(values_only=True))
     header_idx, header = _find_header_row(rows)
     col = {name: header.index(name) for name in _REQUIRED_HEADERS}
+    factory_col = header.index("工厂") if "工厂" in header else None
 
     results = []
     for row in rows[header_idx + 1 :]:
@@ -61,6 +63,7 @@ def parse_shipping_plan(xlsx_path: str | Path, sheet_name: str | None = None) ->
         tracking_id = row[col["追踪编号"]]
         warehouse_raw = row[col["仓库"]]
         qty = row[col["数量"]] or 0
+        factory = row[factory_col] if factory_col is not None else None
         results.append(
             ShippingPlanRow(
                 sku=str(sku).strip(),
@@ -68,6 +71,7 @@ def parse_shipping_plan(xlsx_path: str | Path, sheet_name: str | None = None) ->
                 warehouse_code=normalize_warehouse(warehouse_raw),
                 tracking_id=str(tracking_id).strip() if tracking_id is not None else "",
                 planned_quantity=int(qty),
+                factory=str(factory).strip() if factory is not None else "",
             )
         )
     return results

@@ -73,12 +73,19 @@ def run(
     # (SHIPMENT ID, 归一化后的货号) -> 计划数量
     planned_by_key: dict[tuple[str, str], int] = defaultdict(int)
     plan_display_sku: dict[str, str] = {}  # 归一化货号 -> 计划表里的原始写法，报表展示用
+    # 拆分 PDF 文件名要加的工厂代号：优先按 (SHIPMENT ID, 货号) 精确定位，同一 SKU 在不同批次
+    # 换过工厂的话不会互相覆盖；查不到精确 key 时再退化成按货号查（多数情况下同一 SKU 只有一个工厂）
+    factory_by_key: dict[tuple[str, str], str] = {}
+    factory_by_sku: dict[str, str] = {}
     for row in plan_rows:
         if not row.tracking_id:
             continue
         norm_sku = normalize_sku(row.sku)
         planned_by_key[(row.tracking_id, norm_sku)] += row.planned_quantity
         plan_display_sku.setdefault(norm_sku, row.sku)
+        if row.factory:
+            factory_by_key.setdefault((row.tracking_id, norm_sku), row.factory)
+            factory_by_sku.setdefault(norm_sku, row.factory)
 
     pdf_paths = [Path(p) for p in pdf_paths]
     total_pages = sum(get_page_count(p) for p in pdf_paths)
@@ -120,7 +127,9 @@ def run(
             unresolved_gtins.add(gtin)
         gtin_to_sku[gtin] = rk_sku or wm_sku_raw or gtin
 
-    split_pdf_paths = _write_split_pdfs(by_gtin_warehouse, gtin_to_sku, output_dir)
+    split_pdf_paths = _write_split_pdfs(
+        by_gtin_warehouse, gtin_to_sku, output_dir, factory_by_key, factory_by_sku
+    )
 
     # 按 (SHIPMENT ID, 归一化货号) 汇总实际数量
     actual_by_key: dict[tuple[str, str], int] = defaultdict(int)
@@ -161,10 +170,17 @@ def run(
     )
 
 
-def _write_split_pdfs(by_gtin_warehouse, gtin_to_sku: dict[str, str], output_dir: Path) -> list[Path]:
+def _write_split_pdfs(
+    by_gtin_warehouse,
+    gtin_to_sku: dict[str, str],
+    output_dir: Path,
+    factory_by_key: dict[tuple[str, str], str],
+    factory_by_sku: dict[str, str],
+) -> list[Path]:
     split_pdf_paths: list[Path] = []
     for gtin, by_warehouse in by_gtin_warehouse.items():
         sku_name = gtin_to_sku[gtin]
+        norm_sku = normalize_sku(sku_name)
         for warehouse, entries in by_warehouse.items():
             out_doc = fitz.open()
             src_cache: dict[Path, fitz.Document] = {}
@@ -173,7 +189,11 @@ def _write_split_pdfs(by_gtin_warehouse, gtin_to_sku: dict[str, str], output_dir
                     if pdf_path not in src_cache:
                         src_cache[pdf_path] = fitz.open(pdf_path)
                     out_doc.insert_pdf(src_cache[pdf_path], from_page=label.page_index, to_page=label.page_index)
-                out_path = output_dir / f"{_sanitize_filename(sku_name)}_{warehouse}.pdf"
+                # 这一批箱子理论上都属于同一个 SHIPMENT ID，取第一个箱子的就够用来查工厂
+                shipment_id = entries[0][1].shipment_id
+                factory = factory_by_key.get((shipment_id, norm_sku)) or factory_by_sku.get(norm_sku, "")
+                prefix = f"{_sanitize_filename(factory)}_" if factory else ""
+                out_path = output_dir / f"{prefix}{_sanitize_filename(sku_name)}_{warehouse}.pdf"
                 out_doc.save(out_path)
                 split_pdf_paths.append(out_path)
             finally:

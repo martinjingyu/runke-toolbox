@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QWidget
 from core.dependency import pip_package
 from core.hub_widget import HubWidget, ToolInfo
 
+from .walmart_shipment_reconcile.pylibdmtx_dependency import pylibdmtx_decoder
 from .walmart_shipment_reconcile.tesseract_dependency import tesseract_ocr
 from .walmart_shipment_reconcile.vc_redist_dependency import vc_redist
 
@@ -58,7 +59,7 @@ def build_panel() -> QWidget:
                 pip_package("pymupdf", import_name="fitz", display_name="PyMuPDF（读取 PDF）"),
                 pip_package("Pillow", import_name="PIL", display_name="Pillow（图片处理）"),
                 vc_redist(),
-                pip_package("pylibdmtx", display_name="pylibdmtx（解析箱唛条码）"),
+                pylibdmtx_decoder(),
                 pip_package("pytesseract", display_name="pytesseract（OCR 接口）"),
                 tesseract_ocr(),
             ],

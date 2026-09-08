@@ -65,6 +65,19 @@ def test_parse_shipping_plan_finds_header_row_and_reads_tracking_id(tmp_path):
     assert rows[0].warehouse_code == "DFW5"
     assert rows[0].tracking_id == "1015658WFB"
     assert rows[0].planned_quantity == 3
+    assert rows[0].factory == ""  # 这份表没有"工厂"列，读不到就是空字符串，不应该报错
+
+
+def test_parse_shipping_plan_reads_factory_column_when_present(tmp_path):
+    path = tmp_path / "plan.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["采购单号", "型号", "标签", "工厂", "数量", "仓库", "追踪编号"])
+    ws.append(["GH-001", "TD-RZ-419", "TD-392", "SX", 3, "US(DFW5s)", "1015658WFB"])
+    wb.save(path)
+
+    rows = parse_shipping_plan(path)
+    assert rows[0].factory == "SX"
 
 
 @pytest.mark.slow
