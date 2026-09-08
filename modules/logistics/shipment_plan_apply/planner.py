@@ -125,4 +125,9 @@ def apply_plan(
             if progress_callback is not None:
                 progress_callback(done, total)
 
+    # 这一批新插入的记录，Excel 的筛选范围不会自动跟着扩大——不补这一步的话，数据其实写对了，
+    # 但在 Excel 里拿筛选框去找刚写的记录会找不到，容易被误以为没写进去（见
+    # shipment_summary.py 里 sync_auto_filter 的说明）。
+    summary_book.sync_auto_filter()
+
     return changes

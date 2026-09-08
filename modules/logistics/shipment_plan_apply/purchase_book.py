@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from copy import copy
 
 from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.utils.cell import range_boundaries
 from openpyxl.worksheet.worksheet import Worksheet
 
 from .column_utils import HeaderNotFoundError, column_index_map, find_header_row, require_columns
@@ -213,8 +214,27 @@ class PurchaseBook:
         if insert_at <= self.remaining_col:
             self.remaining_col += 1
         self._rewrite_remaining_formulas()
+        self._sync_auto_filter()
 
         return insert_at
+
+    def _sync_auto_filter(self) -> None:
+        # 插入新的日期列会让表格整体变宽一列，但 Excel 的筛选范围是写死在文件里的固定区间，
+        # 不会自动跟着扩——跟 shipment_summary.py 里 sync_auto_filter 是同一个坑，那边是
+        # 行范围过期，这边是列范围过期。只扩大、不缩小。
+        current_ref = self.ws.auto_filter.ref
+        target_min_row, target_min_col = self.header_row, 1
+        target_max_row, target_max_col = self.ws.max_row, self.remaining_col
+        if current_ref:
+            min_col, min_row, max_col, max_row = range_boundaries(current_ref)
+            target_min_row = min(target_min_row, min_row)
+            target_min_col = min(target_min_col, min_col)
+            target_max_row = max(target_max_row, max_row)
+            target_max_col = max(target_max_col, max_col)
+        self.ws.auto_filter.ref = (
+            f"{get_column_letter(target_min_col)}{target_min_row}:"
+            f"{get_column_letter(target_max_col)}{target_max_row}"
+        )
 
     def _shift_column_dimensions(self, inserted_at: int) -> None:
         # 从最右边的列开始往左处理，不然后面的赋值会覆盖掉还没读出来的旧值（跟

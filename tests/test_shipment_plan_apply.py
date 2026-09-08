@@ -416,6 +416,50 @@ def test_shipment_summary_insert_above_preserves_formatting(tmp_path):
     assert ws3.row_dimensions[pending_row].height == 30
 
 
+def test_shipment_summary_reuses_trailing_blank_rows_instead_of_leaving_a_gap(tmp_path):
+    # 回归测试：真实表格踩过的坑——表格末尾经常已经带着好几十行历史遗留的完全空白行（不是
+    # 合计行，就是真的什么都没有）。之前的做法只看"最后一行"是不是空的，直接把新记录插在
+    # 那个位置，完全没管上面那一大片同样空着、本该先被用掉的行——结果新记录跟用户原有的数据
+    # 之间凭空隔出一段空行，看起来像"数据没接上"。现在应该优先把这些空白行填满，新记录跟着
+    # 真实数据紧挨在一起。
+    path = tmp_path / "summary.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    headers = ["采购单号", "型号", "箱数", "箱容", "数量", "ZD", "发货时间", "状态",
+               "仓库", "FBA ID", "追踪编号", "备注", "货代", "出货单号", "so", "编号"]
+    ws.append(headers)
+    ws.append(["PO-1", "M1", 5, 3, 15, None, "待定", "未发货", None, None, None, None, None, None, None, None])
+    ws.append(["PO-2", "M2", 2, 3, 6, None, "待定", "未发货", None, None, None, None, None, None, None, None])
+    # 5 行历史遗留的完全空白行——真实表格里这种行往往还带着格式（边框/填充），只是没有值，
+    # 这里用一下边框强迫 openpyxl 真的把这几行记进内部结构（不然 append 全 None 的行，
+    # openpyxl 会当成什么都没发生，max_row 不会跟着变大，测不出真实场景）。
+    thin = Border(top=Side(style="thin"))
+    for r in range(3, 8):
+        ws.cell(row=r + 1, column=1).border = thin
+    wb.save(path)
+
+    wb2 = openpyxl.load_workbook(path)
+    ws2 = wb2.active
+    book = ShipmentSummaryBook(ws2)
+    assert book._next_blank_row == 4  # 紧跟在真实数据（第 3 行）后面
+    assert book._blank_row_limit == 9  # 5 行空白 -> 一直到第 8 行都能直接用
+
+    changes = book.apply_shipment("PO-1", "M1", 5, "ZD1", dt.date(2026, 9, 1))
+    new_row = changes[0].new_row
+    assert new_row == 4  # 紧挨着真实数据插入，不是跳到第 8 行末尾之后
+    assert ws2.cell(row=new_row, column=1).value == "PO-1"
+    assert ws2.cell(row=new_row, column=5).value == 5
+
+    # 再来一笔：应该接着用第 5 行（下一个空白行），不是又跳回第 4 行或者跳到最后
+    changes2 = book.apply_shipment("PO-2", "M2", 2, "ZD1", dt.date(2026, 9, 1))
+    assert changes2[0].new_row == 5
+    assert ws2.cell(row=5, column=1).value == "PO-2"
+
+    # 中间那些原本空白、还没被用到的行，要保持完全空白，不能被提前写进任何东西
+    for r in (6, 7, 8):
+        assert ws2.cell(row=r, column=1).value is None
+
+
 def test_shipment_summary_insert_above_reindexes_formulas(tmp_path):
     path = tmp_path / "summary.xlsx"
     _write_summary_book(path)
@@ -649,6 +693,34 @@ def test_shipment_summary_quantity_exceeding_pending_raises(tmp_path):
     # "刚好发完"原地转正、把数字写错
     with pytest.raises(Exception):
         book.apply_shipment("PO-1", "M1", 999, "ZD1", dt.date(2026, 9, 1))
+
+
+def test_shipment_summary_sync_auto_filter_extends_stale_range(tmp_path):
+    # 回归测试：真实表里踩过的坑——AutoFilter 的范围是写死在文件里的固定区间，插入新行/
+    # 转正已有行都不会让它自动跟着扩大。写完之后不补这一步的话，数据其实是对的，但在 Excel
+    # 里拿筛选框去找新写的记录会找不到（超出筛选范围看不见），容易被误以为没写进去。这里
+    # 特意让初始筛选范围比数据本身还窄（模拟真实表里筛选范围早就过期的情况），确认调用
+    # sync_auto_filter() 之后范围会扩大到覆盖所有数据，但不会缩小已经比数据边界更大的范围。
+    path = tmp_path / "summary.xlsx"
+    _write_summary_book(path)  # 4 行数据（含表底合计行），17 列
+    wb = openpyxl.load_workbook(path)
+    ws = wb.active
+    ws.auto_filter.ref = "A1:C2"  # 故意设得比实际数据范围窄很多
+    book = ShipmentSummaryBook(ws)
+
+    book.apply_shipment("PO-1", "M1", 5, "ZD1", dt.date(2026, 9, 1))  # 会在表格最下面插一行
+    book.sync_auto_filter()
+
+    from openpyxl.utils.cell import range_boundaries
+    min_col, min_row, max_col, max_row = range_boundaries(ws.auto_filter.ref)
+    assert min_row == 1  # 只扩大，原来的起点（第 1 行）不会被抬高
+    assert max_row == book._max_row  # 覆盖到新插入行之后的最后一行
+    assert max_col >= book._max_column
+
+    # 范围已经比实际数据边界更大（比如人工手动扩过）的话，不应该被这一步缩小
+    ws.auto_filter.ref = f"A1:Z{book._max_row + 50}"
+    book.sync_auto_filter()
+    assert ws.auto_filter.ref == f"A1:Z{book._max_row + 50}"
 
 
 def test_shipment_summary_missing_headers_names_the_table(tmp_path):

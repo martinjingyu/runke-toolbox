@@ -47,6 +47,8 @@ import re
 from copy import copy
 from dataclasses import dataclass
 
+from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import range_boundaries
 from openpyxl.worksheet.worksheet import Worksheet
 
 from .column_utils import column_index_map, find_header_row, require_columns
@@ -137,17 +139,52 @@ class ShipmentSummaryBook:
         # 表格最后一行如果是"合计"行（采购单号/型号都是空的，靠公式统计上面的数据区间），
         # 新插入的"已发货"记录要插在它上面，不能插在它下面——见类文档。不是合计行的话就是
         # None，新记录直接接在表格末尾就行，插入都不用。
-        self._tail_row = self._detect_tail_row()
+        #
+        # _next_blank_row / _blank_row_limit：真实表格踩过的坑——表格末尾经常已经带着几十行
+        # 历史遗留的完全空白行（不是合计行，就是真的什么都没有，比如人工在 Excel 里删过内容
+        # 但没删行）。之前的做法只看"最后一行"是不是空的，是的话直接当成"合计行"位置去插，
+        # 完全没管这一行上面可能还有一大片同样空着、本该先被用掉的行——结果新记录insert 在了
+        # 这片空白区域的最末尾，跟用户真正的数据之间凭空隔出几十行空行，看着像是"数据没接上"。
+        # 这里改成先把表格末尾这一段连续的空白行找出来，插入的时候优先复用（原地写，
+        # 不用挪动/插入任何东西，比插在合计行上面还便宜），用完了才退回到"合计行上面插入"或者
+        # "直接接在表格末尾"这两种（见 _insert_shipped_row）。
+        self._tail_row, self._next_blank_row, self._blank_row_limit = self._detect_tail_state()
 
-    def _detect_tail_row(self) -> int | None:
+    def _detect_tail_state(self) -> tuple[int | None, int, int]:
+        order_col = self.col["采购单号"]
+        model_col = self.col["型号"]
+
         r = self._max_row
         if r <= self.header_row:
-            return None
-        order_no = self.ws.cell(row=r, column=self.col["采购单号"]).value
-        model = self.ws.cell(row=r, column=self.col["型号"]).value
-        if order_no is None and model is None:
-            return r
-        return None
+            return None, self.header_row + 1, self.header_row + 1
+
+        # 最后一行如果连一个格子都没有任何内容，就是纯粹的历史遗留空白行，不是合计行——
+        # 合计行至少会在某一列留着统计公式，不会整行一个值都没有。
+        last_row_totally_blank = not any(
+            self.ws.cell(row=r, column=c).value is not None for c in range(1, self._max_column + 1)
+        )
+        if last_row_totally_blank:
+            tail_row = None
+        else:
+            order_no = self.ws.cell(row=r, column=order_col).value
+            model = self.ws.cell(row=r, column=model_col).value
+            tail_row = r if (order_no is None and model is None) else None
+
+        # 从合计行（如果有）往上、或者表格末尾往上，找最后一条真正有数据（采购单号/型号
+        # 至少有一个非空）的记录——它下面到合计行（或表格末尾）之间，全是可以直接复用的
+        # 空白行。
+        scan_from = (tail_row - 1) if tail_row is not None else r
+        last_real_row = self.header_row
+        for rr in range(scan_from, self.header_row, -1):
+            if (
+                self.ws.cell(row=rr, column=order_col).value is not None
+                or self.ws.cell(row=rr, column=model_col).value is not None
+            ):
+                last_real_row = rr
+                break
+
+        blank_row_limit = tail_row if tail_row is not None else (self._max_row + 1)
+        return tail_row, last_real_row + 1, blank_row_limit
 
     def _build_pending_index(self, progress_callback=None) -> None:
         self._pending_index = {}
@@ -252,6 +289,32 @@ class ShipmentSummaryBook:
 
         return changes
 
+    def sync_auto_filter(self) -> None:
+        """把 AutoFilter（Excel 里那个筛选下拉框）的范围扩展到当前实际数据的边界。
+
+        这张表只会往下变多（待定行原地不动，新记录插在表格最下面），但 Excel 的筛选范围是
+        写死在文件里的一个固定区间，不会自动跟着数据变大而扩展。真实踩过这个坑：写完之后
+        表格里数据确实是对的，但因为筛选范围没跟着扩，在 Excel 里拿筛选框去找刚写进去的记录，
+        找不到那些落在筛选范围以外的新行，会让人误以为"数据没写进去"，其实只是筛选框看不到。
+        一批发货计划跑完之后调一次就够，不用每插一行就调一次。
+
+        只扩大、不缩小——如果现在的筛选范围已经比当前数据边界更大（比如人工手动扩过），
+        原样保留，不会因为这次改动把它缩小。
+        """
+        current_ref = self.ws.auto_filter.ref
+        target_min_row, target_min_col = self.header_row, 1
+        target_max_row, target_max_col = self._max_row, self._max_column
+        if current_ref:
+            min_col, min_row, max_col, max_row = range_boundaries(current_ref)
+            target_min_row = min(target_min_row, min_row)
+            target_min_col = min(target_min_col, min_col)
+            target_max_row = max(target_max_row, max_row)
+            target_max_col = max(target_max_col, max_col)
+        self.ws.auto_filter.ref = (
+            f"{get_column_letter(target_min_col)}{target_min_row}:"
+            f"{get_column_letter(target_max_col)}{target_max_row}"
+        )
+
     def _consume_row(
         self, pending_row: int, quantity: int, order_no: str, model: str, zd: str, ship_date: dt.date
     ) -> ShipmentSummaryChange:
@@ -312,15 +375,26 @@ class ShipmentSummaryBook:
     def _insert_shipped_row(
         self, template_row: int, order_no: str, model: str, quantity: int, boxes, zd: str, ship_date: dt.date
     ) -> int:
-        """在表格最下面插一行"已发货"记录（合计行上面，如果有的话；不然直接接在表格末尾），
-        产品相关的静态字段（长宽高/毛重/产品名称……）照抄 template_row（也就是被扣的那条
-        待定行）——那是这个 SKU 的产品属性，公式列里"引用自己这一行"的部分改成指向新插入的
-        这一行。因为新行永远插在表格最下面，需要挪动的最多只有"合计行"这一行本身，代价是
-        常数，跟待定行在表格哪个位置、这一批发货有多少笔分摊都没关系。
+        """新插一行"已发货"记录，产品相关的静态字段（长宽高/毛重/产品名称……）照抄
+        template_row（也就是被扣的那条待定行）——那是这个 SKU 的产品属性，公式列里"引用自己
+        这一行"的部分改成指向新插入的这一行。
+
+        位置优先级（都是常数级代价，见类文档/__init__ 里 _next_blank_row 的说明）：
+        1. 表格末尾如果还有没用完的历史遗留空白行，直接原地写进去，不用挪动任何东西；
+        2. 空白行用完了，如果有合计行，插在它上面（把它往下挤一位）；
+        3. 都没有，直接接在表格末尾。
         """
-        if self._tail_row is not None:
+        if self._next_blank_row < self._blank_row_limit:
+            new_row = self._next_blank_row
+            self._next_blank_row += 1
+        elif self._tail_row is not None:
             new_row = self._tail_row
             self._push_tail_row_down(1)
+            # 合计行被挤到了新位置，"空白区"的上限也要跟着更新——不过这一片空白已经被
+            # 上面的分支用完了，这里更新完 _blank_row_limit 之后 _next_blank_row 会立刻
+            # 又等于它，下一次插入自然会走这个分支继续把合计行往下挤，逻辑上是连续的。
+            self._blank_row_limit = self._tail_row
+            self._next_blank_row = self._blank_row_limit
         else:
             new_row = self._max_row + 1
             self._max_row = new_row
