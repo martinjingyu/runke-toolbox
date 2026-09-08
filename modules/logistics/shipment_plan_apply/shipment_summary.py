@@ -115,7 +115,10 @@ def _grow_tail_formula(formula: str, old_tail_row: int, new_tail_row: int) -> st
 
 
 class ShipmentSummaryBook:
-    def __init__(self, ws: Worksheet):
+    def __init__(self, ws: Worksheet, progress_callback=None):
+        # progress_callback(done, total)：给界面上报"正在扫描待定库存索引"这一步的进度用
+        # （见 _build_pending_index）——跟 purchase_book.py 里 PurchaseBook 的用法是同一个
+        # 套路，一次报一批次（默认每 200 行），不是每一行都触发一次回调。
         self.ws = ws
         self.header_row = find_header_row(ws, REQUIRED_HEADERS, max_scan_rows=10, context="发货计划汇总表")
         cols = column_index_map(ws, self.header_row)
@@ -130,7 +133,7 @@ class ShipmentSummaryBook:
         # 之一。这里在加载时只扫一遍表建好索引；待定行本身以后再也不会挪位置（见类文档），只有
         # "转正"会让某一行从索引里摘掉，不需要整表重扫。
         self._pending_index: dict[tuple[str, str], list[int]] = {}
-        self._build_pending_index()
+        self._build_pending_index(progress_callback)
         # 表格最后一行如果是"合计"行（采购单号/型号都是空的，靠公式统计上面的数据区间），
         # 新插入的"已发货"记录要插在它上面，不能插在它下面——见类文档。不是合计行的话就是
         # None，新记录直接接在表格末尾就行，插入都不用。
@@ -146,13 +149,17 @@ class ShipmentSummaryBook:
             return r
         return None
 
-    def _build_pending_index(self) -> None:
+    def _build_pending_index(self, progress_callback=None) -> None:
         self._pending_index = {}
         c_order = self.col["采购单号"]
         c_model = self.col["型号"]
         c_ship = self.col["发货时间"]
         c_status = self.col["状态"]
-        for r in range(self.header_row + 1, self._max_row + 1):
+        start_row = self.header_row + 1
+        total = max(self._max_row - start_row + 1, 0)
+        for done, r in enumerate(range(start_row, self._max_row + 1), start=1):
+            if progress_callback is not None and (done % 200 == 0 or done == total):
+                progress_callback(done, total)
             if (
                 self.ws.cell(row=r, column=c_ship).value == PENDING_LABEL
                 # 待定库存必须还是"未发货"状态才真的能被分摊——真实表里踩过坑：有些行已经被

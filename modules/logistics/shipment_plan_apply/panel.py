@@ -147,7 +147,18 @@ class _PreviewWorker(QThread):
 
             self.stage.emit("正在加载发货计划汇总表…")
             summary_wb = openpyxl.load_workbook(self._summary_path, data_only=False)
-            summary_book = ShipmentSummaryBook(summary_wb.active)
+            # openpyxl 读文件这一步（上面那行）本身没有进度可报——它内部解析 XML 是一次性的
+            # 黑箱调用，读多大的表都只能先转圈圈等着。读完文件之后，建待定库存索引这一步是
+            # 我们自己按行扫的，能报真实的百分比，所以单独给它一个阶段名，不要跟上一步的
+            # "正在加载"混在一条状态栏文字里，不然界面会一直停留在"正在加载"不动，看起来
+            # 像卡住了，其实这一步早就结束了。
+            self.stage.emit("正在扫描待定库存索引…")
+            summary_book = ShipmentSummaryBook(
+                summary_wb.active,
+                progress_callback=lambda done, total: self.progress.emit(
+                    "正在扫描待定库存索引", done, total
+                ),
+            )
 
             self.stage.emit("正在校验每一条分摊…")
             plan = build_plan(all_lines, parse_errors, lookup, purchase_book, self._ship_date)
