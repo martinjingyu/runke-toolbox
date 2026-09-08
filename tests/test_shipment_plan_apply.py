@@ -332,6 +332,7 @@ def test_shipment_summary_insert_above_preserves_formatting(tmp_path):
     ws2 = wb2.active
     book = ShipmentSummaryBook(ws2)
     changes = book.apply_shipment("PO-1", "M1", 5, "ZD1", dt.date(2026, 9, 1))
+    book.materialize()
     wb2.save(path)
 
     wb3 = openpyxl.load_workbook(path)
@@ -360,6 +361,7 @@ def test_shipment_summary_insert_above_reindexes_formulas(tmp_path):
     assert change.pending_row == 3
     assert change.pending_remaining_after == 10
 
+    book.materialize()
     wb.save(path)
     wb2 = openpyxl.load_workbook(path, data_only=False)
     ws2 = wb2.active
@@ -395,6 +397,7 @@ def test_shipment_summary_convert_in_place_when_exact_match(tmp_path):
     change = changes[0]
     assert change.kind == "convert_in_place"
     assert change.new_row is None
+    book.materialize()
     assert ws.cell(row=3, column=5).value == 6
     assert ws.cell(row=3, column=7).value == dt.datetime(2026, 9, 1)
     assert ws.cell(row=3, column=8).value == "未发货"
@@ -426,6 +429,7 @@ def test_shipment_summary_ignores_pending_rows_with_non_shipping_status(tmp_path
     assert len(changes) == 1
     assert changes[0].kind == "convert_in_place"
     assert changes[0].pending_row == 3
+    book.materialize()
     # 已取消的那一行必须原封不动，不能被写入任何发货信息
     assert ws2.cell(row=2, column=7).value == "待定"
     assert ws2.cell(row=2, column=8).value == "已取消"
@@ -454,12 +458,14 @@ def test_shipment_summary_blank_fields_actually_clear_stale_values(tmp_path):
     # insert_above：新行是从待定行复制出来的，旧的 仓库/FBA/追踪/备注/货代/出货单/编号 都不该带过去
     changes = book.apply_shipment("PO-1", "M1", 5, "ZD1", dt.date(2026, 9, 1))
     new_row = changes[0].new_row
+    book.materialize()
     for col in (9, 10, 11, 12, 13, 14, 16):  # 仓库/FBA ID/追踪编号/备注/货代/出货单号/编号
         assert ws2.cell(row=new_row, column=col).value is None, f"col {col} 应该清空"
 
     # convert_in_place：原地转正的那一行自己带的旧值也要被清掉
     changes2 = book.apply_shipment("PO-2", "M2", 6, "ZD2", dt.date(2026, 9, 1))
     pending_row = changes2[0].pending_row
+    book.materialize()
     for col in (9, 10, 11, 12, 13, 14, 16):
         assert ws2.cell(row=pending_row, column=col).value is None, f"col {col} 应该清空"
 
@@ -482,6 +488,7 @@ def test_shipment_summary_missing_box_capacity_still_updates_boxes(tmp_path):
 
     changes = book.apply_shipment("PO-1", "M1", 5, "ZD1", dt.date(2026, 9, 1))
     new_row, pending_row = changes[0].new_row, changes[0].pending_row
+    book.materialize()
     # 箱容缺失，箱数算不出来，应该是 None，不能留着模板行的旧箱数 999
     assert ws2.cell(row=new_row, column=3).value is None
     assert ws2.cell(row=pending_row, column=3).value is None
@@ -520,6 +527,7 @@ def test_shipment_summary_skips_zero_quantity_sibling_row(tmp_path):
     assert changes[0].kind == "insert_above"
     assert changes[0].pending_remaining_after == 15
 
+    book.materialize()
     ws2 = wb2.active
     # 那条 0 数量的待定行必须原封不动，一个字段都不能被碰
     zero_row_values = [ws2.cell(row=2, column=c).value for c in range(1, 9)]

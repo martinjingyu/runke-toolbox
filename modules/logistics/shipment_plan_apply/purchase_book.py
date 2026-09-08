@@ -218,7 +218,7 @@ class PurchaseBook:
 
     def _shift_column_dimensions(self, inserted_at: int) -> None:
         # 从最右边的列开始往左处理，不然后面的赋值会覆盖掉还没读出来的旧值（跟
-        # shipment_summary.py 里 _shift_row_heights 是同一个道理，只是行列换了个方向）。
+        # shipment_summary.py 里 materialize() 从后往前处理是同一个道理，只是行列换了个方向）。
         existing_cols = sorted(
             (
                 idx

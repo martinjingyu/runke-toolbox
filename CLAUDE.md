@@ -283,9 +283,9 @@ MODULE_INFO = {
 - **openpyxl 插入行/列不会像 Excel 那样自动调整公式里的单元格引用**。这个库只是读写文件底层
   格式，没有公式引擎。往表格中间插入一行，插入点以下所有行（不只是你直接操作的那一行）里，
   公式文本中引用的行号都要手动改，否则打开 Excel 之后这些公式会读到错位的数据，还不容易发现。
-  参考 `shipment_summary.py` 的 `_reindex_shifted_rows`/`_shift_formula_refs`（通用规则：公式里
-  任何 `>= 插入点` 的行号都要 +1，不只是"自己引用自己这一行"这一种情况，区间公式如
-  `SUM(E6:E100)` 的两个边界都要分别判断）。插入列同理，见 `purchase_book.py` 的
+  参考 `shipment_summary.py` 的 `materialize()`/`_reindex_formula_bulk`（通用规则：公式里
+  任何行号都要按"这一批插入之后它现在挪到第几行"重新算一遍，不只是"自己引用自己这一行"这一种
+  情况，区间公式如 `SUM(E6:E100)` 的两个边界都要分别判断）。插入列同理，见 `purchase_book.py` 的
   `find_or_create_date_column`。—— 已经问过用户要不要换成 `xlwings`（遥控真实 Excel 来做，
   公式调整交给 Excel 自己处理）代替这套手写逻辑，用户选择继续用 openpyxl + 手写修正（更快、
   不依赖 Excel 安装），如果以后这套手写逻辑又踩到没覆盖的公式写法，可以重新考虑这个选项。

@@ -106,6 +106,8 @@ def run_and_capture_diff(
             else None
         ),
     )
+    # apply_plan 跑完的时候，summary_book.materialize() 已经把这一批攒下来的插入/字段修改
+    # 真正写回 worksheet 了（见 planner.py），下面读"变化后"快照能直接读到正确的值。
 
     def _shift_from(inserted_at: int) -> None:
         # insert_above 会在 inserted_at 这一行真的插入了一行，这一行（含）往下的所有已登记
