@@ -85,10 +85,39 @@ def test_parse_walmart_plan(tmp_path):
     assert len(plan.lines) == 2  # 数量为 0 的那行被判定非法，不计入 lines
     assert len(plan.errors) == 1
     assert "正数" in plan.errors[0]
-    assert plan.lines[0].zd == "CK-沃尔玛"
+    # ZD 不是店铺名字本身，是按店铺名字里的关键字映射出来的到站编号
+    assert plan.lines[0].zd == "CK-WM"
+    assert plan.lines[0].destination_label == "CK-沃尔玛"  # 店铺原始名字留给展示用
     assert plan.lines[0].sku_kind == "RK"
     assert plan.lines[0].sku == "TD-348"
-    assert plan.lines[1].zd == "CK-沃尔玛"  # 店铺是靠"沿用上一个非空值"填下来的
+    assert plan.lines[1].zd == "CK-WM"  # 店铺是靠"沿用上一个非空值"填下来的
+
+
+def test_parse_walmart_plan_maps_lo_shop_to_lo_wm(tmp_path):
+    path = tmp_path / "walmart.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["店铺", "RK-SKU", "GTIN", "WM-SKU", "Item name", "预计发货数量"])
+    ws.append(["SX-LO-沃尔玛", "TD-158", "gtin1", "WM-1", "Table Lamp", 15])
+    wb.save(path)
+
+    plan = parse_shipment_plan(path, "Sheet")
+    assert not plan.errors
+    assert plan.lines[0].zd == "LO-WM"
+
+
+def test_parse_walmart_plan_unrecognized_shop_name_reports_error(tmp_path):
+    path = tmp_path / "walmart.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["店铺", "RK-SKU", "GTIN", "WM-SKU", "Item name", "预计发货数量"])
+    ws.append(["未知店铺", "TD-158", "gtin1", "WM-1", "Table Lamp", 15])
+    wb.save(path)
+
+    plan = parse_shipment_plan(path, "Sheet")
+    assert not plan.lines
+    assert len(plan.errors) == 1
+    assert "未知店铺" in plan.errors[0]
 
 
 def _write_amazon_plan(path: Path) -> None:
@@ -308,9 +337,8 @@ def _write_summary_book(path: Path):
 
 
 def test_shipment_summary_insert_above_preserves_formatting(tmp_path):
-    # 回归测试：真实文件是有格式的（字体、填充色、边框、行高），insert_rows 新建出来的空行
-    # 默认没有任何格式，而且行高这种"整行"级别的设置不会跟着 insert_rows 自动往下挪——之前
-    # 就是这两个问题导致用户反馈"写入了新表但排版都没了"。
+    # 回归测试：真实文件是有格式的（字体、填充色、边框、行高），新插入的行要照抄模板行的格式，
+    # 不能是一整行没有任何样式的空白格子；行高这种"整行"级别的设置也要跟着抄一份，不能丢。
     path = tmp_path / "summary.xlsx"
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -332,12 +360,13 @@ def test_shipment_summary_insert_above_preserves_formatting(tmp_path):
     ws2 = wb2.active
     book = ShipmentSummaryBook(ws2)
     changes = book.apply_shipment("PO-1", "M1", 5, "ZD1", dt.date(2026, 9, 1))
-    book.materialize()
     wb2.save(path)
 
     wb3 = openpyxl.load_workbook(path)
     ws3 = wb3.active
     new_row, pending_row = changes[0].new_row, changes[0].pending_row
+    assert pending_row == 2  # 待定行原地不动
+    assert new_row == 4  # 最后一行（PO-2）不是合计行，新记录直接接在表格末尾
     assert ws3.cell(new_row, 1).fill.fgColor.rgb == "00FFFF00"
     assert ws3.cell(new_row, 1).border.top.style == "thin"
     assert ws3.row_dimensions[new_row].height == 30
@@ -357,32 +386,31 @@ def test_shipment_summary_insert_above_reindexes_formulas(tmp_path):
     assert len(changes) == 1
     change = changes[0]
     assert change.kind == "insert_above"
-    assert change.new_row == 2
-    assert change.pending_row == 3
+    assert change.pending_row == 2  # 待定行原地不动，不用挪位置
+    assert change.new_row == 4  # 新记录插在表格最下面（原来合计行所在的位置）
     assert change.pending_remaining_after == 10
 
-    book.materialize()
     wb.save(path)
     wb2 = openpyxl.load_workbook(path, data_only=False)
     ws2 = wb2.active
 
-    # 新行：数量/ZD/发货时间/状态是新值，标签公式正确指向自己这一行
-    assert ws2.cell(row=2, column=5).value == 5  # 数量
-    assert ws2.cell(row=2, column=6).value == "ZD1"
+    # 待定行原地：数量扣减，标签公式还是指向自己这一行，完全不用跟着改
+    assert ws2.cell(row=2, column=5).value == 10
+    assert ws2.cell(row=2, column=7).value == "待定"
     assert ws2.cell(row=2, column=17).value == "=+A2"
 
-    # 原待定行下移到第 3 行：数量扣减，标签公式跟着改成指向第 3 行（不是还停在 =+A2）
-    assert ws2.cell(row=3, column=5).value == 10
-    assert ws2.cell(row=3, column=7).value == "待定"
+    # PO-2/M2 完全没被这次分摊碰到，还在原来的第 3 行，公式也没变
+    assert ws2.cell(row=3, column=1).value == "PO-2"
     assert ws2.cell(row=3, column=17).value == "=+A3"
 
-    # 原来第 3 行（PO-2/M2）被顶到第 4 行，它自己的公式也要跟着改成指向第 4 行
-    assert ws2.cell(row=4, column=1).value == "PO-2"
+    # 新插入的已发货记录：数量/ZD/发货时间/状态是新值，标签公式指向自己这一行（第 4 行）
+    assert ws2.cell(row=4, column=5).value == 5  # 数量
+    assert ws2.cell(row=4, column=6).value == "ZD1"
     assert ws2.cell(row=4, column=17).value == "=+A4"
 
-    # 表底合计行被顶到第 5 行，区间引用整体后移一位——连起始边界 E2 也要变成 E3，因为原来
-    # 第 2 行的数据本身也被这次插入顶到了第 3 行，range 得跟着挪，不能只有区间末尾变
-    assert ws2.cell(row=5, column=5).value == "=SUBTOTAL(9,E3:E4)"
+    # 合计行被顶到第 5 行，区间引用的结束边界从 E3 扩到 E4，把新插入的这一行也算进合计里；
+    # 起始边界 E2 不变——起点那一行（PO-1）本来就没挪位置。
+    assert ws2.cell(row=5, column=5).value == "=SUBTOTAL(9,E2:E4)"
 
 
 def test_shipment_summary_convert_in_place_when_exact_match(tmp_path):
@@ -397,7 +425,6 @@ def test_shipment_summary_convert_in_place_when_exact_match(tmp_path):
     change = changes[0]
     assert change.kind == "convert_in_place"
     assert change.new_row is None
-    book.materialize()
     assert ws.cell(row=3, column=5).value == 6
     assert ws.cell(row=3, column=7).value == dt.datetime(2026, 9, 1)
     assert ws.cell(row=3, column=8).value == "未发货"
@@ -429,7 +456,6 @@ def test_shipment_summary_ignores_pending_rows_with_non_shipping_status(tmp_path
     assert len(changes) == 1
     assert changes[0].kind == "convert_in_place"
     assert changes[0].pending_row == 3
-    book.materialize()
     # 已取消的那一行必须原封不动，不能被写入任何发货信息
     assert ws2.cell(row=2, column=7).value == "待定"
     assert ws2.cell(row=2, column=8).value == "已取消"
@@ -458,14 +484,12 @@ def test_shipment_summary_blank_fields_actually_clear_stale_values(tmp_path):
     # insert_above：新行是从待定行复制出来的，旧的 仓库/FBA/追踪/备注/货代/出货单/编号 都不该带过去
     changes = book.apply_shipment("PO-1", "M1", 5, "ZD1", dt.date(2026, 9, 1))
     new_row = changes[0].new_row
-    book.materialize()
     for col in (9, 10, 11, 12, 13, 14, 16):  # 仓库/FBA ID/追踪编号/备注/货代/出货单号/编号
         assert ws2.cell(row=new_row, column=col).value is None, f"col {col} 应该清空"
 
     # convert_in_place：原地转正的那一行自己带的旧值也要被清掉
     changes2 = book.apply_shipment("PO-2", "M2", 6, "ZD2", dt.date(2026, 9, 1))
     pending_row = changes2[0].pending_row
-    book.materialize()
     for col in (9, 10, 11, 12, 13, 14, 16):
         assert ws2.cell(row=pending_row, column=col).value is None, f"col {col} 应该清空"
 
@@ -488,7 +512,6 @@ def test_shipment_summary_missing_box_capacity_still_updates_boxes(tmp_path):
 
     changes = book.apply_shipment("PO-1", "M1", 5, "ZD1", dt.date(2026, 9, 1))
     new_row, pending_row = changes[0].new_row, changes[0].pending_row
-    book.materialize()
     # 箱容缺失，箱数算不出来，应该是 None，不能留着模板行的旧箱数 999
     assert ws2.cell(row=new_row, column=3).value is None
     assert ws2.cell(row=pending_row, column=3).value is None
@@ -527,7 +550,6 @@ def test_shipment_summary_skips_zero_quantity_sibling_row(tmp_path):
     assert changes[0].kind == "insert_above"
     assert changes[0].pending_remaining_after == 15
 
-    book.materialize()
     ws2 = wb2.active
     # 那条 0 数量的待定行必须原封不动，一个字段都不能被碰
     zero_row_values = [ws2.cell(row=2, column=c).value for c in range(1, 9)]

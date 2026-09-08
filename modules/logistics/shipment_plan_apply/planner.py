@@ -95,10 +95,10 @@ def apply_plan(
     progress_callback=None,
 ) -> list[ShipmentSummaryChange]:
     # progress_callback(done, total)：按"已经处理了几笔分摊"报进度，不是只有个转圈圈的忙碌条。
-    # summary_book.apply_shipment 本身只在内存里记账（见 shipment_summary.py），真正把这一批
-    # 攒下来的插入/字段修改写回 worksheet 是下面 materialize() 这一步——之前是每笔分摊都真的
-    # 插一次行，插入点以下所有行都要跟着搬一遍，一批发货几十上百笔分摊、表又有两三万行的话，
-    # 跑完要几十秒到几分钟；现在只在最后对整张表搬一次，这一步之外几乎不耗时间了。
+    # summary_book.apply_shipment 现在是直接写、立刻生效——新插入的"已发货"记录固定放在表格
+    # 最下面（不挨着被扣的待定行），代价只跟"插了几条新记录"有关，跟待定行在表格哪个位置、
+    # 表格本身多大都没关系，所以不用像之前那样先攒一批改动最后再统一处理（见
+    # shipment_summary.py 顶部说明）。
     if plan.has_blocking_errors:
         raise ValueError("这一批发货计划里还有没解决的错误，不能写入")
 
@@ -124,8 +124,5 @@ def apply_plan(
             done += 1
             if progress_callback is not None:
                 progress_callback(done, total)
-
-    # apply_shipment 只在内存里记了账，这里一次性把整批攒下来的改动写回 worksheet
-    summary_book.materialize()
 
     return changes

@@ -107,6 +107,20 @@ def _parse_quantity(value) -> tuple[int, str | None]:
     return int(value), None
 
 
+# 沃尔玛表里的"店铺"不是 ZD 本身，是店铺名字（比如"CK-沃尔玛"），真正要填进 ZD 的是按店铺名字
+# 里含有的关键字映射出来的到站编号——名字里有 "CK" 就是 "CK-WM"，有 "LO" 就是 "LO-WM"。
+# 顺序有意义：如果以后出现同时含 CK 和 LO 的店铺名，按先出现的规则命中（目前两个关键字互斥，
+# 暂时不会撞上）。
+_WALMART_SHOP_ZD_RULES = [("CK", "CK-WM"), ("LO", "LO-WM")]
+
+
+def _map_walmart_shop_to_zd(shop: str) -> str | None:
+    for keyword, zd in _WALMART_SHOP_ZD_RULES:
+        if keyword in shop:
+            return zd
+    return None
+
+
 def _parse_walmart(ws: Worksheet, header_row: int) -> tuple[list[PlanLine], list[str]]:
     cols = column_index_map(ws, header_row)
     idx = require_columns(cols, WALMART_HEADERS, "沃尔玛发货计划表")
@@ -114,12 +128,12 @@ def _parse_walmart(ws: Worksheet, header_row: int) -> tuple[list[PlanLine], list
 
     lines: list[PlanLine] = []
     errors: list[str] = []
-    last_zd: str | None = None
+    last_shop: str | None = None
 
     for row_no, row in enumerate(ws.iter_rows(min_row=header_row + 1), start=header_row + 1):
         shop_val = row[shop_col - 1].value
         if shop_val is not None and str(shop_val).strip():
-            last_zd = str(shop_val).strip()
+            last_shop = str(shop_val).strip()
 
         sku_val = row[sku_col - 1].value
         if sku_val is None or not str(sku_val).strip():
@@ -130,8 +144,16 @@ def _parse_walmart(ws: Worksheet, header_row: int) -> tuple[list[PlanLine], list
         if qty_val is None or qty_val == "":
             continue
 
-        if not last_zd:
+        if not last_shop:
             errors.append(f"第{row_no}行（SKU={sku}）：这一行之前都没有出现过店铺编号")
+            continue
+
+        zd = _map_walmart_shop_to_zd(last_shop)
+        if zd is None:
+            errors.append(
+                f"第{row_no}行（SKU={sku}）：店铺「{last_shop}」的名字里既没有「CK」也没有「LO」，"
+                "不知道该填哪个 ZD，需要人工确认"
+            )
             continue
 
         qty, err = _parse_quantity(qty_val)
@@ -141,11 +163,11 @@ def _parse_walmart(ws: Worksheet, header_row: int) -> tuple[list[PlanLine], list
 
         lines.append(
             PlanLine(
-                zd=last_zd,
+                zd=zd,
                 sku_kind="RK",
                 sku=sku,
                 quantity=qty,
-                destination_label=last_zd,
+                destination_label=last_shop,
                 source_row=row_no,
             )
         )
