@@ -24,11 +24,26 @@
 这里没有照抄那个折行算法，而是让剩下几行各自成行、往上移——效果是一样的（发货人名字
 不见了），版式更整齐，只是没有做到跟参考例子逐字节一致。
 
+重画的文字要跟原文档保持一样的字体/字号，不能瞎猜：实测这些箱唛只用两种字体——纯英文的
+"FBA:"标签、单号这些是 Helvetica，其余（包括"YYC4"这种看着是纯 ASCII 的 FC 代码）都是
+"STSong-Light"，且每一行的实际字号并不都是 8（比如地址太长会自动缩小），所以每行重画时
+都直接沿用它自己在原文档里的字体名字/字号（从 get_text("dict") 的 span 里读出来），不再
+按"是不是纯 ASCII"去猜该用哪种字体、也不再固定写死 8pt。
+
+"STSong-Light"这个字体本身在原 PDF 里是没嵌入的（标准 14 种 CJK 字体之一，画的时候只写了
+名字，指望阅读器自己有这个字体去替换显示）——PyMuPDF 自带的"china-s"这个替代名字实际指向
+的是内置的"Droid Sans Fallback"（无衬线），跟"STSong-Light"（宋体，衬线）长得不一样，这就是
+之前重画出来的字看着不对的根源。这里改成直接嵌入本机 Windows 自带的 STSong/新宋体字体文件
+（C:／Windows／Fonts／STSONG.TTF，装了中文语言包的 Windows 机器上一般都有），跟原文档其它
+没动过的文字用的是同一款字体，肉眼看不出区别；实在找不到这个字体文件的机器上，退回"china-s"，
+好歹能画出字，不会因为缺字体直接失败。
+
 加拿大目的地的 PDF 还有一层额外处理：一个文件里经常汇总了好几个厂商的货，脱敏之后还要
 按每页的 SKU 查出厂商、把同一个厂商的页面拆到单独文件里，见 ca_split.py。
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -38,9 +53,25 @@ import fitz
 from .ca_split import VendorLookup, split_ca_pdf
 
 _LINE_HEIGHT = 8.0
-_FONT_SIZE = 8.0
-_BASELINE_OFFSET = 6.5  # insert_text 的落点是文字基线，这个偏移量是从行框顶部换算成基线用的
+_BASELINE_RATIO = 6.5 / 8.0  # insert_text 的落点是文字基线，这个比例是从行框顶部换算成基线用的
+# （原来是按固定 8pt 字号反推出的常数 6.5，现在字号跟着原文档每行实际字号变，换算成比例）
 _KNOWN_COUNTRIES = {"美国", "加拿大"}
+
+_CJK_FONT_NAME = "rk-fba-cjk"
+_CJK_FONT_CANDIDATES = [
+    r"C:\Windows\Fonts\STSONG.TTF",  # 跟原文档里没嵌入的"STSong-Light"是同一款字体，最匹配
+    r"C:\Windows\Fonts\simsun.ttc",  # 找不到就退而求其次，用新宋体（视觉上很接近）
+]
+
+
+def _find_cjk_font_path() -> str | None:
+    for path in _CJK_FONT_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+_CJK_FONT_PATH = _find_cjk_font_path()  # 进程启动时找一次，不用每画一行字就查一次文件系统
 
 
 @dataclass
@@ -70,13 +101,22 @@ def find_pdfs(directory: str | Path) -> list[Path]:
     return sorted(Path(directory).glob("*.pdf"))
 
 
-def _is_ascii(text: str) -> bool:
-    return all(ord(c) < 128 for c in text)
+def _is_latin_font(source_font: str) -> bool:
+    return "helvetica" in source_font.lower()
 
 
-def _draw_line(page: fitz.Page, x: float, top_y: float, text: str) -> None:
-    font = "Helvetica" if _is_ascii(text) else "china-s"
-    page.insert_text((x, top_y + _BASELINE_OFFSET), text, fontname=font, fontsize=_FONT_SIZE, color=(0, 0, 0))
+def _draw_line(page: fitz.Page, x: float, top_y: float, text: str, source_font: str, size: float) -> None:
+    """按 source_font 判断这行文字在原文档里用的是拉丁字体还是中文字体，画的时候原样沿用，
+    字号也用原文档这一行自己的字号（不同行字号本来就不一样，别再统一写死 8pt）。"""
+    baseline_y = top_y + size * _BASELINE_RATIO
+    if _is_latin_font(source_font):
+        page.insert_text((x, baseline_y), text, fontname="Helvetica", fontsize=size, color=(0, 0, 0))
+    elif _CJK_FONT_PATH is not None:
+        page.insert_text(
+            (x, baseline_y), text, fontname=_CJK_FONT_NAME, fontfile=_CJK_FONT_PATH, fontsize=size, color=(0, 0, 0)
+        )
+    else:
+        page.insert_text((x, baseline_y), text, fontname="china-s", fontsize=size, color=(0, 0, 0))
 
 
 def _get_lines(page: fitz.Page) -> list[dict]:
@@ -87,7 +127,15 @@ def _get_lines(page: fitz.Page) -> list[dict]:
         for line in block["lines"]:
             text = "".join(span["text"] for span in line["spans"])
             if text.strip():
-                lines.append({"text": text, "bbox": line["bbox"]})
+                first_span = line["spans"][0]
+                lines.append(
+                    {
+                        "text": text,
+                        "bbox": line["bbox"],
+                        "font": first_span["font"],
+                        "size": first_span["size"],
+                    }
+                )
     return lines
 
 
@@ -149,15 +197,17 @@ def redact_page(page: fitz.Page, file_name: str, page_index: int) -> PageResult:
     page.apply_redactions()
 
     fc_code = dest_lines[1]["text"].strip()
-    new_dest = [f"FBA: {fc_code}"] + [l["text"] for l in dest_lines[2:5]]
-    for i, text in enumerate(new_dest):
-        _draw_line(page, x0, dest_top + i * _LINE_HEIGHT, text)
+    # 合并出来的第一行是"FBA: "接 FC 代码，FC 代码那部分原样保留了 dest_lines[1] 的文字，
+    # 字体/字号也跟着用 dest_lines[1] 自己的（两个样本里都是 STSong-Light 8pt，不管前面
+    # 加不加"FBA: "前缀，视觉上都是这一行本来的字体，不用"FBA:"标签那一行缩小过的字号）
+    new_dest = [(f"FBA: {fc_code}", dest_lines[1])] + [(l["text"], l) for l in dest_lines[2:5]]
+    for i, (text, style) in enumerate(new_dest):
+        _draw_line(page, x0, dest_top + i * _LINE_HEIGHT, text, style["font"], style["size"])
 
     if country != "加拿大":
         origin_top = origin_lines[0]["bbox"][1]
-        new_origin = [l["text"] for l in origin_lines[1:4]]
-        for i, text in enumerate(new_origin):
-            _draw_line(page, ox0, origin_top + i * _LINE_HEIGHT, text)
+        for i, l in enumerate(origin_lines[1:4]):
+            _draw_line(page, ox0, origin_top + i * _LINE_HEIGHT, l["text"], l["font"], l["size"])
 
     return PageResult(file_name, page_index, country, modified=True)
 
