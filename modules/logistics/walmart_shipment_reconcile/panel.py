@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..default_paths import SHIPPING_PLAN_TABLE
 from .reconcile import RunReport
 from .reconcile import run as run_reconcile
 from .reconcile import write_report_xlsx
@@ -107,6 +108,7 @@ class WalmartReconcilePanel(QWidget):
         inputs_layout.addLayout(row)
 
         row, self._plan_edit = _file_picker_row("发货计划表", self._browse_plan)
+        self._plan_edit.setText(SHIPPING_PLAN_TABLE)
         inputs_layout.addLayout(row)
 
         row, self._pdf_edit = _file_picker_row("箱唛 PDF（可多选，一个仓一个文件）", self._browse_pdfs)

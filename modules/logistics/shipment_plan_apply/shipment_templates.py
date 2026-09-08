@@ -195,7 +195,10 @@ def _parse_amazon(ws: Worksheet, header_row: int) -> tuple[list[PlanLine], list[
 
             lines.append(
                 PlanLine(
-                    zd=last_zd,
+                    # 亚马逊表里没有沃尔玛/海外仓那种独立的"到站"编号列——目的地是靠 SKU 右边
+                    # 一整排国家代码列（US/CA……）本身区分的，哪一列填了数量就发去哪，"店铺"
+                    # 只是用来定位这批 SKU 属于哪个店铺，不是到站信息，不能拿它当 ZD
+                    zd=dest_name,
                     sku_kind="AMZ",
                     sku=sku,
                     quantity=qty,

@@ -111,6 +111,9 @@ def test_parse_amazon_plan_splits_multi_destination_rows(tmp_path):
     dest_by_sku = {(l.sku, l.destination_label): l.quantity for l in plan.lines}
     assert dest_by_sku[("TD-CKD-206", "US")] == 30
     assert dest_by_sku[("TD-CK-584", "CA")] == 21
+    # ZD 要填的是这一行发去的目的地（US/CA），不是"店铺"（cinkeda）——后面写发货计划汇总表的
+    # ZD 列，看的就是这个字段
+    assert all(l.zd == l.destination_label for l in plan.lines)
     assert dest_by_sku[("TD-CK-57", "US")] == 21
     assert dest_by_sku[("TD-CK-57", "CA")] == 21
     assert all(l.sku_kind == "AMZ" for l in plan.lines)

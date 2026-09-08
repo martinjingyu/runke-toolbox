@@ -20,9 +20,14 @@
        计划表这边总数没登记全）。
     5. 输出文件放进"工厂/仓库"两层文件夹（跟 CA1/CG 拆分工具一样的结构），文件名是
        "工厂 仓库 箱数箱.pdf"。
+
+ship_date 由调用方传入（界面上选的日期），还要求发货计划表里这一行的「发货时间」等于这个
+日期——同一个仓库、同一个厂商完全可能同时挂着好几个不同日期的待发记录，只有这次要处理的这份
+箱唛 PDF 对应的那个发货日期才算数，见 shipping_plan.py 顶部说明。
 """
 from __future__ import annotations
 
+import datetime as dt
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -45,17 +50,19 @@ class LowmSplitReport:
     notes: list[str] = field(default_factory=list)
 
 
-def run(label_pdf_path: str | Path, shipping_plan_path: str | Path) -> LowmSplitReport:
+def run(label_pdf_path: str | Path, shipping_plan_path: str | Path, ship_date: dt.date) -> LowmSplitReport:
     label_pdf_path = Path(label_pdf_path)
     warehouse_code = derive_warehouse_code(label_pdf_path)
 
     doc = fitz.open(label_pdf_path)
     try:
-        totals = load_pending_boxes_by_factory(shipping_plan_path, warehouse_code)
+        totals = load_pending_boxes_by_factory(shipping_plan_path, warehouse_code, ship_date)
 
         report = LowmSplitReport()
         if not totals:
-            report.notes.append(f"发货计划表里查不到仓库含 {warehouse_code} + 未发货的记录，未拆分")
+            report.notes.append(
+                f"发货计划表里查不到仓库含 {warehouse_code} + 未发货 + 发货时间={ship_date.isoformat()} 的记录，未拆分"
+            )
             return report
 
         page_count = doc.page_count

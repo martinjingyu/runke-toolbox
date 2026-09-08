@@ -7,6 +7,10 @@
 "TD-243 10箱.pdf"）——厂商已经体现在文件夹名字里了，文件名不用重复写一遍。不同厂商的标签
 分到不同的厂商文件夹，同一个厂商的多个标签落进同一个厂商文件夹下面同一个站点子文件夹。
 
+ship_date 由调用方传入（界面上选的日期），还要求发货计划表里这一行的「发货时间」等于这个
+日期——同一个仓库、同一个厂商完全可能同时挂着好几个不同日期的待发记录，只有这次要处理的
+这批标签对应的那个发货日期才算数，见 shipping_plan.py 顶部说明。
+
 站点代号（拿去筛发货计划表「仓库」列的关键字）不写死，从标签 PDF 的文件名推导：取文件名
 （不含扩展名）里第一个"-"之前的部分，没有"-"就用整个文件名——"CA1.pdf"和"CA1-XXX.pdf"都
 推出"CA1"，"CG-TS-MD.pdf"推出"CG"，跟目前见过的两个站点的实际命名习惯都对得上。不同站点
@@ -25,6 +29,7 @@ label_pdf_cg.py），但版式差异只影响"怎么从 PDF 里解析出箱子�
 """
 from __future__ import annotations
 
+import datetime as dt
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,7 +64,12 @@ def derive_warehouse_code(label_pdf_path: str | Path) -> str:
     return stem.split("-", 1)[0].strip()
 
 
-def run(label_pdf_path: str | Path, shipping_plan_path: str | Path, parse_boxes: ParseBoxesFn) -> SplitReport:
+def run(
+    label_pdf_path: str | Path,
+    shipping_plan_path: str | Path,
+    parse_boxes: ParseBoxesFn,
+    ship_date: dt.date,
+) -> SplitReport:
     label_pdf_path = Path(label_pdf_path)
     warehouse_code = derive_warehouse_code(label_pdf_path)
 
@@ -78,12 +88,15 @@ def run(label_pdf_path: str | Path, shipping_plan_path: str | Path, parse_boxes:
                 pages_by_label[item.sku][box.box_no] = box.pages
 
         pdf_labels = set(pages_by_label)
-        pending = load_pending_groups(shipping_plan_path, wanted_labels=pdf_labels, warehouse_code=warehouse_code)
+        pending = load_pending_groups(
+            shipping_plan_path, wanted_labels=pdf_labels, warehouse_code=warehouse_code, ship_date=ship_date
+        )
 
         report = SplitReport()
         for label in sorted(pdf_labels - set(pending.groups) - set(pending.conflicts)):
             report.notes.append(
-                f"「{label}」：标签 PDF 里有这个标签的箱子，但发货计划表里查不到仓库含 {warehouse_code} + 未发货的记录，跳过"
+                f"「{label}」：标签 PDF 里有这个标签的箱子，但发货计划表里查不到仓库含 {warehouse_code} + "
+                f"未发货 + 发货时间={ship_date.isoformat()} 的记录，跳过"
             )
         for label, factories in sorted(pending.conflicts.items()):
             report.notes.append(f"「{label}」：发货计划表里匹配到的待发行「工厂」不一致（{'、'.join(factories)}），跳过，需要人工核对")

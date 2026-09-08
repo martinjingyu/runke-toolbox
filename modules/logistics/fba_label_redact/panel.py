@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..default_paths import PRODUCT_INFO_TABLE
 from .ca_split import load_vendor_lookup
 from .redact import FBA_DIR_NAME, RunReport
 from .redact import run as run_redact
@@ -98,6 +99,7 @@ class FbaLabelRedactPanel(QWidget):
         inputs_layout.addLayout(row)
 
         row, self._product_table_edit = _file_picker_row("产品信息表（可选）", self._browse_product_table)
+        self._product_table_edit.setText(PRODUCT_INFO_TABLE)
         inputs_layout.addLayout(row)
         product_table_hint = QLabel("发往加拿大、汇总了多个厂商的 PDF，需要这张表才能按厂商拆分；不选也能正常脱敏，只是这类 PDF 不会拆分。")
         product_table_hint.setWordWrap(True)

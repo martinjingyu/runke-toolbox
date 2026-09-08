@@ -9,11 +9,13 @@
 """
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 
-from PySide6.QtCore import QThread, QUrl, Signal
+from PySide6.QtCore import QDate, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QDateEdit,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -26,6 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..default_paths import SHIPPING_PLAN_TABLE
 from .splitter import ParseBoxesFn, SplitReport
 from .splitter import run as run_split
 
@@ -34,15 +37,16 @@ class _SplitWorker(QThread):
     succeeded = Signal(object)  # SplitReport
     failed = Signal(str)
 
-    def __init__(self, label_pdf_path: str, shipping_plan_path: str, parse_boxes: ParseBoxesFn):
+    def __init__(self, label_pdf_path: str, shipping_plan_path: str, parse_boxes: ParseBoxesFn, ship_date: dt.date):
         super().__init__()
         self._label_pdf_path = label_pdf_path
         self._shipping_plan_path = shipping_plan_path
         self._parse_boxes = parse_boxes
+        self._ship_date = ship_date
 
     def run(self):
         try:
-            report = run_split(self._label_pdf_path, self._shipping_plan_path, self._parse_boxes)
+            report = run_split(self._label_pdf_path, self._shipping_plan_path, self._parse_boxes, self._ship_date)
         except Exception as exc:
             self.failed.emit(str(exc))
             return
@@ -61,6 +65,18 @@ def _file_picker_row(label_text: str, filter_text: str, on_pick) -> tuple[QHBoxL
     button.clicked.connect(lambda: on_pick(line_edit))
     row.addWidget(button)
     return row, line_edit
+
+
+def _date_picker_row(label_text: str) -> tuple[QHBoxLayout, QDateEdit]:
+    row = QHBoxLayout()
+    row.addWidget(QLabel(label_text))
+    date_edit = QDateEdit()
+    date_edit.setCalendarPopup(True)
+    date_edit.setDisplayFormat("yyyy-MM-dd")
+    date_edit.setDate(QDate.currentDate())
+    row.addWidget(date_edit)
+    row.addStretch(1)
+    return row, date_edit
 
 
 class LabelSplitPanel(QWidget):
@@ -83,11 +99,15 @@ class LabelSplitPanel(QWidget):
         inputs_layout.addLayout(row)
 
         row, self._plan_edit = _file_picker_row("发货计划表", "Excel 文件 (*.xlsx *.xlsm)", self._browse_plan)
+        self._plan_edit.setText(SHIPPING_PLAN_TABLE)
+        inputs_layout.addLayout(row)
+
+        row, self._ship_date_edit = _date_picker_row("发货时间")
         inputs_layout.addLayout(row)
 
         hint = QLabel(
             "站点代号取自入库标签 PDF 的文件名（第一个「-」之前的部分）。"
-            "按发货计划表里「仓库含这个站点代号、状态=未发货」的标签，从入库标签 PDF 里抽出对应箱子的页面，"
+            "按发货计划表里「仓库含这个站点代号、状态=未发货、发货时间=上面选的日期」的标签，从入库标签 PDF 里抽出对应箱子的页面，"
             "在标签 PDF 所在目录下按「厂商代号/站点代号」新建两层文件夹（比如「GH/CA1」），"
             "文件按「标签 箱数合计箱.pdf」命名，存到对应的文件夹里。"
         )
@@ -147,8 +167,9 @@ class LabelSplitPanel(QWidget):
 
         # 拆出来的文件按厂商各分到一个新文件夹（比如「GH CA1」），都建在标签 PDF 所在目录下——
         # 打开这个目录就能看到本次新建的所有厂商文件夹，不用逐个记文件夹名字
+        ship_date = self._ship_date_edit.date().toPython()
         self._output_dir = Path(label_pdf_path).parent
-        self._worker = _SplitWorker(label_pdf_path, plan_path, self._parse_boxes)
+        self._worker = _SplitWorker(label_pdf_path, plan_path, self._parse_boxes, ship_date)
         self._worker.succeeded.connect(self._on_success)
         self._worker.failed.connect(self._on_failure)
         self._worker.start()

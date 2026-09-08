@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 
 from PySide6.QtCore import QThread, QUrl, Signal
@@ -23,23 +24,25 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..default_paths import SHIPPING_PLAN_TABLE
 from .lowm_splitter import LowmSplitReport
 from .lowm_splitter import run as run_lowm_split
-from .panel import _file_picker_row
+from .panel import _date_picker_row, _file_picker_row
 
 
 class _LowmSplitWorker(QThread):
     succeeded = Signal(object)  # LowmSplitReport
     failed = Signal(str)
 
-    def __init__(self, label_pdf_path: str, shipping_plan_path: str):
+    def __init__(self, label_pdf_path: str, shipping_plan_path: str, ship_date: dt.date):
         super().__init__()
         self._label_pdf_path = label_pdf_path
         self._shipping_plan_path = shipping_plan_path
+        self._ship_date = ship_date
 
     def run(self):
         try:
-            report = run_lowm_split(self._label_pdf_path, self._shipping_plan_path)
+            report = run_lowm_split(self._label_pdf_path, self._shipping_plan_path, self._ship_date)
         except Exception as exc:
             self.failed.emit(str(exc))
             return
@@ -65,11 +68,15 @@ class LowmSplitPanel(QWidget):
         inputs_layout.addLayout(row)
 
         row, self._plan_edit = _file_picker_row("发货计划表", "Excel 文件 (*.xlsx *.xlsm)", self._browse_plan)
+        self._plan_edit.setText(SHIPPING_PLAN_TABLE)
+        inputs_layout.addLayout(row)
+
+        row, self._ship_date_edit = _date_picker_row("发货时间")
         inputs_layout.addLayout(row)
 
         hint = QLabel(
             "站点代号取自箱唛 PDF 的文件名（第一个「-」之前的部分）。"
-            "不需要认 SKU：按发货计划表里「仓库含这个站点代号、状态=未发货」的记录按厂商汇总箱数，"
+            "不需要认 SKU：按发货计划表里「仓库含这个站点代号、状态=未发货、发货时间=上面选的日期」的记录按厂商汇总箱数，"
             "直接按顺序切页给各厂商，在箱唛 PDF 所在目录下按「厂商代号/站点代号」新建两层文件夹（比如「GH/DFW5s」），"
             "文件按「厂商代号 站点代号 箱数箱.pdf」命名。"
         )
@@ -127,8 +134,9 @@ class LowmSplitPanel(QWidget):
         self._status_label.setText("正在处理……")
         self._log.clear()
 
+        ship_date = self._ship_date_edit.date().toPython()
         self._output_dir = Path(label_pdf_path).parent
-        self._worker = _LowmSplitWorker(label_pdf_path, plan_path)
+        self._worker = _LowmSplitWorker(label_pdf_path, plan_path, ship_date)
         self._worker.succeeded.connect(self._on_success)
         self._worker.failed.connect(self._on_failure)
         self._worker.start()
