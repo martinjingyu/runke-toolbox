@@ -13,6 +13,7 @@ from core.dependency import pip_package
 from core.hub_widget import HubWidget, ToolInfo
 
 from .walmart_shipment_reconcile.tesseract_dependency import tesseract_ocr
+from .walmart_shipment_reconcile.vc_redist_dependency import vc_redist
 
 
 def _build_walmart_reconcile_panel() -> QWidget:
@@ -56,6 +57,7 @@ def build_panel() -> QWidget:
                 pip_package("openpyxl", display_name="openpyxl（读写 Excel）"),
                 pip_package("pymupdf", import_name="fitz", display_name="PyMuPDF（读取 PDF）"),
                 pip_package("Pillow", import_name="PIL", display_name="Pillow（图片处理）"),
+                vc_redist(),
                 pip_package("pylibdmtx", display_name="pylibdmtx（解析箱唛条码）"),
                 pip_package("pytesseract", display_name="pytesseract（OCR 接口）"),
                 tesseract_ocr(),
