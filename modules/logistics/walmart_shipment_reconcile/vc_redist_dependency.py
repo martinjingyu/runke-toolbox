@@ -11,7 +11,6 @@ pylibdmtx 没装好，其实是这个运行库缺失，跟这个模块要不要�
 """
 from __future__ import annotations
 
-import ctypes
 import os
 import subprocess
 import sys
@@ -24,16 +23,32 @@ from core.dependency import Dependency
 # 微软官方短链，长期稳定指向最新的 VC++ 2015-2022 x64 运行库，国内一般不用梯子也能下。
 _INSTALLER_URL = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
 
+# 微软官方推荐的检测方式：装了 VC++ 2015-2022 Redistributable 会在这两个注册表位置之一
+# （64 位系统上两个都会写）写 Installed=1。之前试过用 ctypes.WinDLL("vcruntime140.dll")
+# 判断，结果是假阳性——Python 解释器自己进程里就已经加载了同名 DLL，哪怕系统级根本没装
+# 这个运行库，探测也会误判成"已安装"，导致该弹的安装提示没弹出来，直接崩在真正用到
+# libdmtx-64.dll 依赖的地方。查注册表才是可靠的判断方式。
+_REGISTRY_KEY_PATHS = [
+    r"SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\X64",
+    r"SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\X64",
+]
+
 
 def _is_installed() -> bool:
     if sys.platform != "win32":
         return True  # 这个依赖只在 Windows 上有意义
-    for dll_name in ("vcruntime140.dll", "msvcp140.dll"):
+
+    import winreg
+
+    for key_path in _REGISTRY_KEY_PATHS:
         try:
-            ctypes.WinDLL(dll_name)
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+                installed, _ = winreg.QueryValueEx(key, "Installed")
+                if installed == 1:
+                    return True
         except OSError:
-            return False
-    return True
+            continue
+    return False
 
 
 def _install(report: Callable[[str], None]) -> None:
