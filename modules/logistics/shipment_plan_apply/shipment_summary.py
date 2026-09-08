@@ -115,6 +115,44 @@ class ShipmentSummaryBook:
         # 这是 apply_shipment 反复调用（一批发货几十上百次分摊）时最大的隐藏耗时来源之一。
         self._max_row = ws.max_row
         self._max_column = ws.max_column
+        # (采购单号, 型号) -> 待定行号列表（行号升序，对应先到先扣的顺序）。pending_rows()
+        # 之前每次调用都要把整张表（真实文件两三万行）从头扫到尾，apply_shipment 一次分摊
+        # 至少调用两次、一批发货几十上百次分摊，等于反复全表扫描，是这个工具最大的耗时来源
+        # 之一。这里在加载时只扫一遍表建好索引，之后插入/转正的时候增量维护（见
+        # _consume_row），不用再重新扫表。
+        self._pending_index: dict[tuple[str, str], list[int]] = {}
+        self._build_pending_index()
+
+    def _build_pending_index(self) -> None:
+        c_order = self.col["采购单号"]
+        c_model = self.col["型号"]
+        c_ship = self.col["发货时间"]
+        c_status = self.col["状态"]
+        for r in range(self.header_row + 1, self._max_row + 1):
+            if (
+                self.ws.cell(row=r, column=c_ship).value == PENDING_LABEL
+                # 待定库存必须还是"未发货"状态才真的能被分摊——真实表里踩过坑：有些行已经被
+                # 标成"已取消"/"无库存"，但当时改状态的人忘了把"发货时间"这一列也从"待定"
+                # 改回去，只看"发货时间"会把这些早就作废的行错当成还能用的库存去扣，把货错发
+                # 到不该发的地方。两个条件都满足才算数。
+                and self.ws.cell(row=r, column=c_status).value == NEW_STATUS
+            ):
+                order_no = self.ws.cell(row=r, column=c_order).value
+                model = self.ws.cell(row=r, column=c_model).value
+                self._pending_index.setdefault((order_no, model), []).append(r)
+
+    def _shift_pending_index(self, inserted_at: int) -> None:
+        # 插入一行之后，原来行号 >= 插入点的待定行都要整体 +1——跟 _reindex_shifted_rows/
+        # _shift_row_heights 是同一个道理，只是这次挪的是索引里记的行号，不是表格内容本身。
+        for rows in self._pending_index.values():
+            for i, r in enumerate(rows):
+                if r >= inserted_at:
+                    rows[i] = r + 1
+
+    def _remove_from_pending_index(self, order_no: str, model: str, row: int) -> None:
+        rows = self._pending_index.get((order_no, model))
+        if rows is not None and row in rows:
+            rows.remove(row)
 
     def _scan_formula_columns(self) -> list[int]:
         formula_columns: set[int] = set()
@@ -126,19 +164,10 @@ class ShipmentSummaryBook:
         return sorted(formula_columns)
 
     def pending_rows(self, order_no: str, model: str) -> list[int]:
-        """按行顺序返回这个采购单号+型号名下所有"发货时间=待定"的行号（可能不止一个）。"""
-        c_order = self.col["采购单号"]
-        c_model = self.col["型号"]
-        c_ship = self.col["发货时间"]
-        return [
-            r
-            for r in range(self.header_row + 1, self._max_row + 1)
-            if (
-                self.ws.cell(row=r, column=c_order).value == order_no
-                and self.ws.cell(row=r, column=c_model).value == model
-                and self.ws.cell(row=r, column=c_ship).value == PENDING_LABEL
-            )
-        ]
+        """按行顺序返回这个采购单号+型号名下所有"发货时间=待定 且 状态=未发货"的行号
+        （可能不止一个）。直接查 __init__ 时建好的索引，不用每次都扫表。
+        """
+        return list(self._pending_index.get((order_no, model), []))
 
     def find_pending_row(self, order_no: str, model: str) -> int | None:
         """随便找一行待定行（不保证是哪一行，也不保证是唯一一行）——只用来做"这个采购单号+
@@ -220,6 +249,10 @@ class ShipmentSummaryBook:
             template_row = pending_row + 1  # 待定行内容因为插入整体下移了一行
             self.ws.insert_rows(new_row)
             self._max_row += 1  # 见 __init__ 里 self._max_row 的说明，插一行就跟着 +1，不重新扫表
+            # 索引里记的行号也要跟着往下挪一位——这一行本身（连同它在索引里的位置）挪到了
+            # template_row，扣完之后数量变小但还是"待定"，本来就该继续留在索引里，不用额外
+            # 增删，靠这一步整体位移就自动对了。
+            self._shift_pending_index(new_row)
             # insert_rows 只搬单元格的值，不会像 Excel 那样把公式里"指向自己这一行"的引用
             # 跟着往下调整——插入点以下所有行（不只是待定行）都要先把这类公式修好，不然
             # 插入点以下所有行的 CBM/总材重/总实重/DP 等公式都会读到错位的旧数据。
@@ -258,6 +291,9 @@ class ShipmentSummaryBook:
         # quantity == pending_qty：正好扣完这一行，原地转正
         self._set_explicit_fields(pending_row, order_no, model, quantity, boxes, zd, ship_date, NEW_STATUS)
         self._blank_fields(pending_row)
+        # 这一行发货时间从"待定"变成了具体日期，不再是待定库存，从索引里摘掉，不然后面
+        # 同一个采购单号+型号再来一笔分摊，会把这一行当成还能扣的库存重复用。
+        self._remove_from_pending_index(order_no, model, pending_row)
         return ShipmentSummaryChange(
             kind="convert_in_place",
             pending_row=pending_row,

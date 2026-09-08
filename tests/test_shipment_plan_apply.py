@@ -400,6 +400,38 @@ def test_shipment_summary_convert_in_place_when_exact_match(tmp_path):
     assert ws.cell(row=3, column=8).value == "未发货"
 
 
+def test_shipment_summary_ignores_pending_rows_with_non_shipping_status(tmp_path):
+    # 回归测试：真实表里有极少数行"发货时间"还留着"待定"，但"状态"已经被人工改成"已取消"
+    # 或"无库存"（改状态的时候忘了把发货时间一起改掉）。这种行不是真的能扣的库存，只看
+    # "发货时间=待定"会把它们错当成待定库存去扣，必须同时要求"状态=未发货"才算数。
+    path = tmp_path / "summary.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    headers = ["采购单号", "型号", "箱数", "箱容", "数量", "ZD", "发货时间", "状态",
+               "仓库", "FBA ID", "追踪编号", "备注", "货代", "出货单号", "so", "编号"]
+    ws.append(headers)
+    ws.append(["PO-1", "M1", 1, 3, 3, None, "待定", "已取消", None, None, None, None, None, None, None, None])
+    ws.append(["PO-1", "M1", 5, 3, 15, None, "待定", "未发货", None, None, None, None, None, None, None, None])
+    wb.save(path)
+
+    wb2 = openpyxl.load_workbook(path)
+    ws2 = wb2.active
+    book = ShipmentSummaryBook(ws2)
+
+    # 只有第 3 行（状态=未发货）才是真正的待定行；第 2 行（已取消）不该出现在候选里
+    assert book.pending_rows("PO-1", "M1") == [3]
+    assert book.total_pending_quantity("PO-1", "M1") == 15
+
+    changes = book.apply_shipment("PO-1", "M1", 15, "ZD1", dt.date(2026, 9, 1))
+    assert len(changes) == 1
+    assert changes[0].kind == "convert_in_place"
+    assert changes[0].pending_row == 3
+    # 已取消的那一行必须原封不动，不能被写入任何发货信息
+    assert ws2.cell(row=2, column=7).value == "待定"
+    assert ws2.cell(row=2, column=8).value == "已取消"
+    assert ws2.cell(row=2, column=5).value == 3
+
+
 def test_shipment_summary_blank_fields_actually_clear_stale_values(tmp_path):
     # 回归测试：真实数据里"待定"行经常已经带着"编号"/"备注"这些字段的历史值（比如"无库存9"）——
     # _blank_fields 之前用 ws.cell(row, col, value=None) 清空，这个写法在 openpyxl 里是个坑：
