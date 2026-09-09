@@ -357,6 +357,37 @@ def test_apply_plan_appends_rows_to_both_sheets_with_seq_numbering(tmp_path, tab
     assert s_ws.cell(row=7, column=4).fill.fgColor.rgb == s_ws.cell(row=6, column=4).fill.fgColor.rgb
 
 
+def test_apply_plan_writes_column_sum_formulas_in_shipment_summary(tmp_path, tables):
+    # 发货计划汇总表「箱数/数量/CBM/总材重/总实重」这几列，业务要求在表头正上方那一行（这个
+    # 测试表头在第 5 行，所以是第 4 行）放一个"这一列往下全部数据的合计"，写死一个很大的
+    # 区间结束行号（不是当前表格实际最后一行），新增行不用跟着改这几个公式。每次批量导入都
+    # 应该重新写一遍（哪怕这次批量是空的也不影响——覆盖写不会因为多写一次就出错），万一被人
+    # 手动删掉/改坏，下次导入会自动纠正回来。
+    purchase_path, summary_path = tables
+    order_folder = tmp_path / "orders"
+    order_folder.mkdir()
+    _write_order_file(
+        order_folder / "order1.xlsx",
+        order_no="GH-2609002",
+        supplier="广东GH工厂",
+        rows=[("TD-RZ-419", "简约花瓶灰色树脂台灯", 90, dt.datetime(2026, 10, 1))],
+    )
+
+    purchase_wb = openpyxl.load_workbook(purchase_path)
+    summary_wb = openpyxl.load_workbook(summary_path)
+    plan = build_plan(order_folder, purchase_wb.active, summary_wb.active, {"广东GH工厂": "GH"})
+    apply_plan(plan, purchase_wb.active, summary_wb.active)
+
+    s_ws = summary_wb.active
+    # 表头在第 5 行（column_index_map 里 箱数=5列E, 数量=7列G, CBM=12列L, 总材重=13列M,
+    # 总实重=14列N），公式放在第 4 行，区间从第 6 行（表头再往下一行，第一条真数据）起
+    assert s_ws.cell(row=4, column=5).value == "=SUBTOTAL(9,E6:E1000000)"  # 箱数
+    assert s_ws.cell(row=4, column=7).value == "=SUBTOTAL(9,G6:G1000000)"  # 数量
+    assert s_ws.cell(row=4, column=12).value == "=SUBTOTAL(9,L6:L1000000)"  # CBM
+    assert s_ws.cell(row=4, column=13).value == "=SUBTOTAL(9,M6:M1000000)"  # 总材重
+    assert s_ws.cell(row=4, column=14).value == "=SUBTOTAL(9,N6:N1000000)"  # 总实重
+
+
 def test_apply_plan_seq_comes_from_order_no_not_table_history_max(tmp_path, tables):
     # 回归测试：真实表格里「序号」不是这张表自己按行独立编的号，是订单号自带的信息——订单号
     # 最后三位数字就是该填的序号，业务方本来就是这么手填的。真实数据验证过：这张表的序号

@@ -31,6 +31,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.formula import ArrayFormula
 from openpyxl.worksheet.worksheet import Worksheet
 
@@ -60,6 +61,27 @@ _ORDER_SEQ_RE = re.compile(r"(\d{3})$")
 def _parse_seq_from_order_no(order_no: str) -> str | None:
     m = _ORDER_SEQ_RE.search(order_no)
     return m.group(1) if m else None
+
+
+# 发货计划汇总表「箱数/数量/CBM/总材重/总实重」这几列，业务要求在表头正上方那一行（跟采购
+# 汇总表第 1 行放 SUBTOTAL 的位置是同一个道理——header_row 再往上一行）放一个"这一列往下
+# 全部数据的合计"，方便打开表格一眼看到总数，不用自己拉到最后一行或者手动选中一整列。
+# 区间结束行号写死成一个很大的数（不是"当前表格实际最后一行"），这样新增行只要没超过这个
+# 数，公式本身完全不用跟着改——跟采购汇总表那边 SUBTOTAL(9,I4:I1000732) 是同一个思路，
+# 见 planner.py 顶部说明。每次批量导入完都重新写一遍这几个公式（覆盖写，不是只在缺失时才
+# 补）：这样万一被人手动改坏、删掉过，下次导入会自动纠正回来，不用另外记着去修。
+_SUM_RANGE_END_ROW = 1_000_000
+_SUM_COLUMNS = ["箱数", "数量", "CBM", "总材重", "总实重"]
+
+
+def _write_summary_column_sums(ws: Worksheet, header_row: int, cols: dict[str, int]) -> None:
+    total_row = header_row - 1
+    first_data_row = header_row + 1
+    for name in _SUM_COLUMNS:
+        col = cols[name]
+        letter = get_column_letter(col)
+        formula = f"=SUBTOTAL(9,{letter}{first_data_row}:{letter}{_SUM_RANGE_END_ROW})"
+        ws.cell(row=total_row, column=col).value = formula
 
 
 @dataclass
@@ -443,7 +465,10 @@ def apply_plan(plan: Plan, purchase_ws: Worksheet, summary_ws: Worksheet, progre
     s_cols = column_index_map(summary_ws, summary_book.header_row)
     require_columns(
         s_cols,
-        ["采购单号", "型号", "产品名称", "箱数", "箱容", "数量", "长", "宽", "高", "毛重", "交货时间", "发货时间", "工厂", "状态"],
+        [
+            "采购单号", "型号", "产品名称", "箱数", "箱容", "数量", "长", "宽", "高", "毛重",
+            "交货时间", "发货时间", "工厂", "状态", "CBM", "总材重", "总实重",
+        ],
         "发货计划汇总表",
     )
     s_last_row = _last_data_row(summary_ws, summary_book.header_row, s_cols["采购单号"])
@@ -569,6 +594,7 @@ def apply_plan(plan: Plan, purchase_ws: Worksheet, summary_ws: Worksheet, progre
         progress_callback(len(plan.items), len(plan.items))
 
     _merge_order_seq_cells(purchase_ws, plan.items, p_cols["序号"], p_last_row)
+    _write_summary_column_sums(summary_ws, summary_book.header_row, s_cols)
 
 
 def _merge_order_seq_cells(ws: Worksheet, items: list[PlanItem], seq_col: int, first_new_row: int) -> None:
