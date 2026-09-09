@@ -140,6 +140,8 @@ class _SupplierMapDialog(QDialog):
 class _PreviewWorker(QThread):
     succeeded = Signal(object)  # (plan, purchase_wb, summary_wb)
     failed = Signal(str)
+    stage = Signal(str)
+    progress = Signal(str, int, int)
 
     def __init__(self, folder: str, purchase_path: str, summary_path: str, supplier_map: dict[str, str]):
         super().__init__()
@@ -150,13 +152,64 @@ class _PreviewWorker(QThread):
 
     def run(self):
         try:
+            self.stage.emit("正在加载采购订单汇总表文件…")
             purchase_wb = openpyxl.load_workbook(self._purchase_path, data_only=False)
+            self.stage.emit("正在加载发货计划汇总表文件…")
             summary_wb = openpyxl.load_workbook(self._summary_path, data_only=False)
-            plan = build_plan(Path(self._folder), purchase_wb.active, summary_wb.active, self._supplier_map)
+            plan = build_plan(
+                Path(self._folder),
+                purchase_wb.active,
+                summary_wb.active,
+                self._supplier_map,
+                progress_callback=lambda stage, done, total: self.progress.emit(stage, done, total),
+            )
         except Exception as exc:
             self.failed.emit(str(exc))
             return
         self.succeeded.emit((plan, purchase_wb, summary_wb))
+
+
+class _ConfirmWriteWorker(QThread):
+    succeeded = Signal(str, str)  # 采购订单汇总表备份文件名, 发货计划汇总表备份文件名
+    backup_failed = Signal(str)
+    save_failed = Signal(str, str, str)  # 报错信息, 采购订单汇总表备份文件名, 发货计划汇总表备份文件名
+    stage = Signal(str)
+    progress = Signal(int, int)
+
+    def __init__(self, plan: Plan, purchase_path: str, summary_path: str, purchase_wb, summary_wb):
+        super().__init__()
+        self._plan = plan
+        self._purchase_path = purchase_path
+        self._summary_path = summary_path
+        self._purchase_wb = purchase_wb
+        self._summary_wb = summary_wb
+
+    def run(self):
+        self.stage.emit("正在备份原文件…")
+        try:
+            purchase_backup = backup_file(self._purchase_path)
+            summary_backup = backup_file(self._summary_path)
+        except Exception as exc:
+            self.backup_failed.emit(str(exc))
+            return
+
+        try:
+            self.stage.emit("正在写入新增的行…")
+            apply_plan(
+                self._plan,
+                self._purchase_wb.active,
+                self._summary_wb.active,
+                progress_callback=lambda done, total: self.progress.emit(done, total),
+            )
+            self.stage.emit("正在保存采购订单汇总表…")
+            self._purchase_wb.save(self._purchase_path)
+            self.stage.emit("正在保存发货计划汇总表…")
+            self._summary_wb.save(self._summary_path)
+        except Exception as exc:
+            self.save_failed.emit(str(exc), purchase_backup.name, summary_backup.name)
+            return
+
+        self.succeeded.emit(purchase_backup.name, summary_backup.name)
 
 
 class PurchaseOrderImportPanel(QWidget):
@@ -165,6 +218,7 @@ class PurchaseOrderImportPanel(QWidget):
         self._settings = QSettings()
         self._supplier_store = SupplierCodeStore(self._settings)
         self._worker: _PreviewWorker | None = None
+        self._confirm_worker: _ConfirmWriteWorker | None = None
 
         self._plan: Plan | None = None
         self._purchase_wb = None
@@ -309,7 +363,21 @@ class PurchaseOrderImportPanel(QWidget):
         self._worker = _PreviewWorker(folder, purchase_path, summary_path, self._supplier_store.mapping())
         self._worker.succeeded.connect(self._on_preview_succeeded)
         self._worker.failed.connect(self._on_preview_failed)
+        self._worker.stage.connect(self._on_stage)
+        self._worker.progress.connect(self._on_preview_progress)
         self._worker.start()
+
+    def _on_stage(self, text: str):
+        self._progress.setRange(0, 0)
+        self._status_label.setText(text)
+
+    def _on_preview_progress(self, stage: str, done: int, total: int):
+        if total <= 0:
+            return
+        if self._progress.maximum() != total:
+            self._progress.setRange(0, total)
+        self._progress.setValue(done)
+        self._status_label.setText(f"{stage}：{done}/{total}")
 
     def _on_preview_succeeded(self, payload):
         plan, purchase_wb, summary_wb = payload
@@ -388,31 +456,62 @@ class PurchaseOrderImportPanel(QWidget):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        try:
-            purchase_backup = backup_file(self._purchase_path)
-            summary_backup = backup_file(self._summary_path)
-        except Exception as exc:
-            QMessageBox.critical(self, "备份失败", f"没能先备份原文件，写入已取消：{exc}")
-            return
-
-        try:
-            apply_plan(self._plan, self._purchase_wb.active, self._summary_wb.active)
-            self._purchase_wb.save(self._purchase_path)
-            self._summary_wb.save(self._summary_path)
-        except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "写入失败",
-                f"存盘失败：{exc}\n\n备份文件还在（{purchase_backup} / {summary_backup}），原文件可能已经部分改动，建议手动检查。",
-            )
-            return
-
-        self._status_label.setText(
-            f"已写入。备份文件：{purchase_backup.name} / {summary_backup.name}"
-        )
+        # 备份 + 写入 + 存盘都放到后台线程去做——这两张真实表常年是几千到几万行，备份/存盘
+        # 本身就要读写几十 MB 的文件，apply_plan() 里 copy_row() 还要碰采购汇总表里多达
+        # 16384 列的每一行（见 planner.py 的说明），同步跑在界面线程上会让整个界面卡死好一阵，
+        # 用户分不清是卡住了还是真的在干活。跟"发货计划自动更新"（purchase_only_panel.py）
+        # 保持一致的做法：搬到 QThread 里跑，用 stage/progress 信号告诉界面现在到哪一步了。
+        self._preview_button.setEnabled(False)
         self._confirm_button.setEnabled(False)
+        self._progress.setRange(0, 0)
+        self._progress.show()
+        self._status_label.setText("正在写入……请耐心等待，不要关闭窗口。")
+
+        self._confirm_worker = _ConfirmWriteWorker(
+            self._plan, self._purchase_path, self._summary_path, self._purchase_wb, self._summary_wb
+        )
+        self._confirm_worker.succeeded.connect(self._on_confirm_succeeded)
+        self._confirm_worker.backup_failed.connect(self._on_backup_failed)
+        self._confirm_worker.save_failed.connect(self._on_save_failed)
+        self._confirm_worker.stage.connect(self._on_stage)
+        self._confirm_worker.progress.connect(self._on_confirm_progress)
+        self._confirm_worker.start()
+
+    def _on_confirm_progress(self, done: int, total: int):
+        if total <= 0:
+            return
+        if self._progress.maximum() != total:
+            self._progress.setRange(0, total)
+        self._progress.setValue(done)
+        self._status_label.setText(f"正在写入新增的行：{done}/{total}")
+
+    def _on_confirm_succeeded(self, purchase_backup_name: str, summary_backup_name: str):
+        self._progress.hide()
+        self._preview_button.setEnabled(True)
+        self._status_label.setText(f"已写入。备份文件：{purchase_backup_name} / {summary_backup_name}")
         self._confirm_button.setText("已写入")
+
+    def _on_backup_failed(self, message: str):
+        self._progress.hide()
+        self._preview_button.setEnabled(True)
+        self._confirm_button.setEnabled(True)
+        self._status_label.setText("写入失败，见弹窗说明。")
+        QMessageBox.critical(self, "备份失败", f"没能先备份原文件，写入已取消：{message}")
+
+    def _on_save_failed(self, message: str, purchase_backup_name: str, summary_backup_name: str):
+        self._progress.hide()
+        self._preview_button.setEnabled(True)
+        self._confirm_button.setEnabled(True)
+        self._status_label.setText("写入失败，见弹窗说明。")
+        QMessageBox.critical(
+            self,
+            "写入失败",
+            f"存盘失败：{message}\n\n"
+            f"备份文件还在（{purchase_backup_name} / {summary_backup_name}），原文件可能已经部分改动，建议手动检查。",
+        )
 
     def stop_running_tasks(self):
         if self._worker is not None and self._worker.isRunning():
             self._worker.wait(5000)
+        if self._confirm_worker is not None and self._confirm_worker.isRunning():
+            self._confirm_worker.wait(30000)

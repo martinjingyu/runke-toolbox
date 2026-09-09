@@ -188,7 +188,7 @@ def test_build_plan_matches_history_and_computes_boxes(tmp_path, tables):
     order_folder.mkdir()
     _write_order_file(
         order_folder / "order1.xlsx",
-        order_no="GH-2609001",
+        order_no="GH-2609002",
         supplier="广东GH工厂",
         rows=[("TD-RZ-419", "简约花瓶灰色树脂台灯", 90, dt.datetime(2026, 10, 1))],
     )
@@ -300,7 +300,7 @@ def test_apply_plan_appends_rows_to_both_sheets_with_seq_numbering(tmp_path, tab
     order_folder.mkdir()
     _write_order_file(
         order_folder / "order1.xlsx",
-        order_no="GH-2609001",
+        order_no="GH-2609002",
         supplier="广东GH工厂",
         rows=[
             ("TD-RZ-419", "简约花瓶灰色树脂台灯", 90, dt.datetime(2026, 10, 1)),
@@ -315,14 +315,17 @@ def test_apply_plan_appends_rows_to_both_sheets_with_seq_numbering(tmp_path, tab
 
     p_ws = purchase_wb.active
     # 已有数据在第 4 行（表头第 2 行、子表头第 3 行），新行接着追加在第 5、6 行
-    assert p_ws.cell(row=5, column=1).value == "002"  # 序号：已有 001 -> 002
-    assert p_ws.cell(row=5, column=2).value == "GH-2609001"
+    # 序号不是这张表自己按行独立编的号，是从订单号「GH-2609002」最后三位解析出来的（见
+    # planner.py 的 _parse_seq_from_order_no），跟已有那一行的序号"001"没有递增关系，纯属
+    # 巧合看起来像是"+1"——换一个订单号（比如"GH-2609099"）序号也会跟着变成"099"。
+    assert p_ws.cell(row=5, column=1).value == "002"
+    assert p_ws.cell(row=5, column=2).value == "GH-2609002"
     assert p_ws.cell(row=5, column=5).value == "GH"
     assert p_ws.cell(row=5, column=7).value == "TD-RZ-419"
     assert p_ws.cell(row=5, column=9).value == 90
     assert p_ws.cell(row=5, column=10).value == "pcs"
     assert p_ws.cell(row=5, column=6).value is None  # 店铺列模板行本来就是空的，抄过来还是空
-    # 同一个订单号（GH-2609001）下的两个型号共用一个序号：值只写在第 5 行，第 6 行跟它合并
+    # 同一个订单号（GH-2609002）下的两个型号共用一个序号：值只写在第 5 行，第 6 行跟它合并
     # （合并单元格里非左上角的格子，openpyxl 读出来的 value 固定是 None，不能拿来断言）
     assert any(
         rng.min_row == 5 and rng.max_row == 6 and rng.min_col == 1 and rng.max_col == 1
@@ -337,7 +340,7 @@ def test_apply_plan_appends_rows_to_both_sheets_with_seq_numbering(tmp_path, tab
 
     s_ws = summary_wb.active
     # 已有数据在第 6 行，新行接着追加在第 7、8 行
-    assert s_ws.cell(row=7, column=1).value == "GH-2609001"
+    assert s_ws.cell(row=7, column=1).value == "GH-2609002"
     assert s_ws.cell(row=7, column=2).value == "TD-RZ-419"
     assert s_ws.cell(row=7, column=5).value == 30  # 箱数 = 90/3
     assert s_ws.cell(row=7, column=6).value == 3  # 箱容复制自历史
@@ -352,6 +355,70 @@ def test_apply_plan_appends_rows_to_both_sheets_with_seq_numbering(tmp_path, tab
     assert s_ws.cell(row=7, column=16).value is None  # FBA ID 同理
     # 产品名称格子的底色格式也应该跟着抄过来
     assert s_ws.cell(row=7, column=4).fill.fgColor.rgb == s_ws.cell(row=6, column=4).fill.fgColor.rgb
+
+
+def test_apply_plan_seq_comes_from_order_no_not_table_history_max(tmp_path, tables):
+    # 回归测试：真实表格里「序号」不是这张表自己按行独立编的号，是订单号自带的信息——订单号
+    # 最后三位数字就是该填的序号，业务方本来就是这么手填的。真实数据验证过：这张表的序号
+    # 计数周期在中间某处（大概率是年份）重新起过，历史上出现过更早的行序号反而比更晚的行更
+    # 大（比如 2025 年 12 月的一批到了 305，2026 年 9 月最新一行只有 213）——如果按"表格里
+    # 全部历史序号取最大值 +1"，新订单会被写成一个跟订单号本身完全对不上、还离谱地偏大的号。
+    # 这里在现有表格里插一条历史上"序号"畸高的行（模拟真实数据里 2025 年 12 月那批），确认
+    # 新订单的序号只看自己订单号解出来的值，不受这条历史畸高行影响。
+    purchase_path, summary_path = tables
+    purchase_wb = openpyxl.load_workbook(purchase_path)
+    p_ws = purchase_wb.active
+    p_ws.append([
+        "305", "WJ-2512305", dt.datetime(2025, 12, 1), dt.datetime(2026, 1, 1), "WJ", None,
+        "TD-OLD-3", "历史畸高序号的旧型号", 30, "pcs", None, None, None, None, None,
+    ])
+    purchase_wb.save(purchase_path)
+
+    order_folder = tmp_path / "orders"
+    order_folder.mkdir()
+    _write_order_file(
+        order_folder / "order1.xlsx",
+        order_no="SX-2609215",
+        supplier="广东GH工厂",
+        rows=[("TD-RZ-419", "简约花瓶灰色树脂台灯", 90, dt.datetime(2026, 10, 1))],
+    )
+
+    purchase_wb = openpyxl.load_workbook(purchase_path)
+    summary_wb = openpyxl.load_workbook(summary_path)
+    plan = build_plan(order_folder, purchase_wb.active, summary_wb.active, {"广东GH工厂": "GH"})
+    assert not plan.items[0].notes or "序号" not in "；".join(plan.items[0].notes)
+    apply_plan(plan, purchase_wb.active, summary_wb.active)
+
+    p_ws = purchase_wb.active
+    # 新行接在第 6 行（第 4 行是原有数据，第 5 行是刚插的历史畸高序号行）；序号应该是订单号
+    # 「SX-2609215」自己解出来的"215"，不是"305 + 1 = 306"。
+    assert p_ws.cell(row=6, column=1).value == "215"
+
+
+def test_apply_plan_seq_falls_back_to_table_max_when_order_no_unparseable(tmp_path, tables):
+    # 订单号格式不是"XX-YYMMNNN"（解析不出最后三位当序号）的话，退回旧的"表格里已有的最大
+    # 序号 +1"逻辑，不能什么都不写；build_plan 阶段应该在这一条记录的 notes 里提示，让人知道
+    # 这个序号是"猜"出来的、需要核对，不是从订单号本身来的。
+    purchase_path, summary_path = tables
+    order_folder = tmp_path / "orders"
+    order_folder.mkdir()
+    _write_order_file(
+        order_folder / "order1.xlsx",
+        order_no="临时订单A",
+        supplier="广东GH工厂",
+        rows=[("TD-RZ-419", "灯", 90, dt.datetime(2026, 10, 1))],
+    )
+
+    purchase_wb = openpyxl.load_workbook(purchase_path)
+    summary_wb = openpyxl.load_workbook(summary_path)
+    plan = build_plan(order_folder, purchase_wb.active, summary_wb.active, {"广东GH工厂": "GH"})
+    assert plan.items[0].seq_hint is None
+    assert any("序号" in n for n in plan.items[0].notes)
+
+    apply_plan(plan, purchase_wb.active, summary_wb.active)
+    p_ws = purchase_wb.active
+    # 表格里已有一行序号"001"，解析不出来就退回"最大值 +1"
+    assert p_ws.cell(row=5, column=1).value == "002"
 
 
 def test_apply_plan_copies_seq_column_style_when_template_row_is_a_merged_non_anchor_cell(tmp_path):
@@ -394,7 +461,7 @@ def test_apply_plan_copies_seq_column_style_when_template_row_is_a_merged_non_an
     order_folder.mkdir()
     _write_order_file(
         order_folder / "order1.xlsx",
-        order_no="GH-2609001",
+        order_no="GH-2609002",
         supplier="广东GH工厂",
         rows=[("TD-RZ-419", "简约花瓶灰色树脂台灯", 90, dt.datetime(2026, 10, 1))],
     )
@@ -430,7 +497,7 @@ def test_apply_plan_unmerges_stray_merge_that_overlaps_new_rows(tmp_path, tables
     order_folder.mkdir()
     _write_order_file(
         order_folder / "order1.xlsx",
-        order_no="GH-2609001",
+        order_no="GH-2609002",
         supplier="广东GH工厂",
         rows=[("TD-RZ-419", "简约花瓶灰色树脂台灯", 90, dt.datetime(2026, 10, 1))],
     )
@@ -473,7 +540,7 @@ def test_apply_plan_preserves_dim_formulas_in_shipment_summary(tmp_path):
     order_folder.mkdir()
     _write_order_file(
         order_folder / "order1.xlsx",
-        order_no="GH-2609001",
+        order_no="GH-2609002",
         supplier="广东GH工厂",
         rows=[("TD-RZ-419", "简约花瓶灰色树脂台灯", 90, dt.datetime(2026, 10, 1))],
     )
@@ -532,7 +599,7 @@ def test_apply_plan_preserves_dim_formulas_for_duplicate_named_columns(tmp_path)
     order_folder.mkdir()
     _write_order_file(
         order_folder / "order1.xlsx",
-        order_no="GH-2609001",
+        order_no="GH-2609002",
         supplier="广东GH工厂",
         rows=[("TD-RZ-419", "简约花瓶灰色树脂台灯", 90, dt.datetime(2026, 10, 1))],
     )
@@ -597,7 +664,7 @@ def test_apply_plan_reindexes_array_formula_for_second_dim_group(tmp_path):
     order_folder.mkdir()
     _write_order_file(
         order_folder / "order1.xlsx",
-        order_no="GH-2609001",
+        order_no="GH-2609002",
         supplier="广东GH工厂",
         rows=[("TD-RZ-419", "简约花瓶灰色树脂台灯", 90, dt.datetime(2026, 10, 1))],
     )
@@ -662,7 +729,7 @@ def test_apply_plan_ignores_broken_template_row_and_always_uses_first_data_row(t
     order_folder.mkdir()
     _write_order_file(
         order_folder / "order1.xlsx",
-        order_no="GH-2609001",
+        order_no="GH-2609002",
         supplier="广东GH工厂",
         rows=[("TD-RZ-419", "简约花瓶灰色树脂台灯", 90, dt.datetime(2026, 10, 1))],
     )
