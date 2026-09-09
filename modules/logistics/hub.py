@@ -35,6 +35,18 @@ def _build_shipment_plan_apply_panel() -> QWidget:
     return ShipmentPlanApplyPanel()
 
 
+def _build_purchase_allocation_apply_panel() -> QWidget:
+    from .shipment_plan_apply.purchase_only_panel import PurchaseAllocationApplyPanel
+
+    return PurchaseAllocationApplyPanel()
+
+
+def _build_shipment_summary_apply_panel() -> QWidget:
+    from .shipment_plan_apply.summary_only_panel import ShipmentSummaryApplyPanel
+
+    return ShipmentSummaryApplyPanel()
+
+
 def _build_logistics_tracking_panel() -> QWidget:
     from .logistics_tracking.panel import LogisticsTrackingPanel
 
@@ -98,6 +110,24 @@ def build_panel() -> QWidget:
             name="发货计划自动更新",
             description="把运营提交的发货计划表导入，自动更新采购订单汇总表和发货计划汇总表",
             build_panel=_build_shipment_plan_apply_panel,
+            dependencies=[
+                pip_package("openpyxl", display_name="openpyxl（读写 Excel）"),
+            ],
+        ),
+        ToolInfo(
+            id="purchase_allocation_apply",
+            name="采购订单分摊更新",
+            description="把运营提交的发货计划表导入，只更新采购订单汇总表（不碰发货计划汇总表）",
+            build_panel=_build_purchase_allocation_apply_panel,
+            dependencies=[
+                pip_package("openpyxl", display_name="openpyxl（读写 Excel）"),
+            ],
+        ),
+        ToolInfo(
+            id="shipment_summary_apply",
+            name="发货计划汇总表更新",
+            description="把运营提交的发货计划表导入，只更新发货计划汇总表（不碰采购订单汇总表）",
+            build_panel=_build_shipment_summary_apply_panel,
             dependencies=[
                 pip_package("openpyxl", display_name="openpyxl（读写 Excel）"),
             ],

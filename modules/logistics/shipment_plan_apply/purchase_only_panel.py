@@ -1,11 +1,13 @@
-"""发货计划自动更新——这个工具的界面。
+"""采购订单分摊更新——这个工具的界面。
 
-跟其它工具比，这个要小心得多：真的会改真实的采购汇总表和发货计划汇总表这两份数据。所以
-界面分两步，中间必须停下来让人看："生成预览"只在内存里跑完整个流程，不落盘；确认没问题了
-再点"确认写入"，这时候才备份原文件、真的存盘。
+跟"发货计划自动更新"是同一套输入（同样读运营提供的发货计划表、同样先查在售产品信息总表
+翻译成货号、同样按采购日期从早到晚分摊），但只写采购订单汇总表，完全不碰发货计划汇总表——
+发货计划汇总表那边要按 ZD 拆成一条条待发货记录，这个工具不需要那一层，同一个货号不管这一批
+里分了几个不同的 ZD，最终都是汇总累加进采购订单汇总表同一个日期列（见 planner.py 的
+apply_plan_purchase_only）。
 
-预览、写入都可能要处理几千上万行的表格（发货计划汇总表插入一行要重新扫描它后面所有行的
-公式，见 shipment_summary.py），跑起来可能要几分钟，所以放在后台线程里跑，不能卡住界面。
+界面结构、"预览再确认写入"两步走、写入前自动备份，都跟"发货计划自动更新"保持一致，只是少了
+发货计划汇总表那一栏输入和对应的改动对比表。
 """
 from __future__ import annotations
 
@@ -37,11 +39,10 @@ from core.backup import backup_file
 from core.diff_preview import DiffPreviewGroup
 
 from .column_utils import column_index_map
-from .diff import PreviewResult, run_and_capture_diff
+from .diff import DiffTable, run_and_capture_diff_purchase_only
 from .planner import Plan, build_plan
 from .product_lookup import load_product_lookup
 from .purchase_book import PurchaseBook
-from .shipment_summary import ShipmentSummaryBook
 from .shipment_templates import PlanLine, list_sheet_names, parse_shipment_plan
 
 _EDITABLE_FIELD = "备注"
@@ -50,12 +51,10 @@ _TEMPLATE_LABELS = {"walmart": "沃尔玛", "amazon": "亚马逊", "overseas": "
 _LABEL_TO_TEMPLATE = {v: k for k, v in _TEMPLATE_LABELS.items()}
 _AUTO_LABEL = "自动识别"
 
-# 这三张表长期维护、路径基本不会变，记住上次选过的路径，下次打开软件自动填上，不用每次
-# 都重新浏览——存到 QSettings 里（Windows 是注册表，Mac 是本地 ini 文件），跟软件本身的
-# 数据文件（config.local.yaml、data/ 目录）无关，纯粹是这个输入框的"上次填了什么"。
-_SETTINGS_KEY_PRODUCT = "shipment_plan_apply/product_path"
-_SETTINGS_KEY_PURCHASE = "shipment_plan_apply/purchase_path"
-_SETTINGS_KEY_SUMMARY = "shipment_plan_apply/summary_path"
+# 这两张表长期维护、路径基本不会变，记住上次选过的路径——跟"发货计划自动更新"分开存一份，
+# 不共用同一个 key，避免这两个工具互相覆盖对方记的路径（这两个工具选的往往是不同的文件）。
+_SETTINGS_KEY_PRODUCT = "purchase_allocation_apply/product_path"
+_SETTINGS_KEY_PURCHASE = "purchase_allocation_apply/purchase_path"
 
 
 def _next_wednesday(today: dt.date | None = None) -> dt.date:
@@ -74,7 +73,6 @@ def _file_picker_row(label_text: str, on_browse) -> tuple[QHBoxLayout, QLineEdit
     button.clicked.connect(on_browse)
     row.addWidget(button)
     return row, line_edit
-
 
 
 class _PlanFileEntry:
@@ -100,23 +98,21 @@ class _PlanFileEntry:
 
 
 class _PreviewWorker(QThread):
-    succeeded = Signal(object)  # (plan, result_or_None, purchase_wb, summary_wb, purchase_book, summary_book)
+    succeeded = Signal(object)  # (plan, diff_table_or_None, purchase_wb, purchase_book)
     failed = Signal(str)
-    stage = Signal(str)  # 只报"现在在做什么"，用在算不出总数/瞬间就完事的步骤（读文件、解析、校验）
-    progress = Signal(str, int, int)  # 阶段名, done, total——用在真的耗时、数得出总数的步骤
+    stage = Signal(str)
+    progress = Signal(str, int, int)
 
     def __init__(
         self,
         product_path: str,
         purchase_path: str,
-        summary_path: str,
-        plan_files: list[tuple[str, str, str | None]],  # (path, sheet_name, template_type)
+        plan_files: list[tuple[str, str, str | None]],
         ship_date: dt.date,
     ):
         super().__init__()
         self._product_path = product_path
         self._purchase_path = purchase_path
-        self._summary_path = summary_path
         self._plan_files = plan_files
         self._ship_date = ship_date
 
@@ -145,60 +141,38 @@ class _PreviewWorker(QThread):
                 ),
             )
 
-            self.stage.emit("正在加载发货计划汇总表…")
-            summary_wb = openpyxl.load_workbook(self._summary_path, data_only=False)
-            # openpyxl 读文件这一步（上面那行）本身没有进度可报——它内部解析 XML 是一次性的
-            # 黑箱调用，读多大的表都只能先转圈圈等着。读完文件之后，建待定库存索引这一步是
-            # 我们自己按行扫的，能报真实的百分比，所以单独给它一个阶段名，不要跟上一步的
-            # "正在加载"混在一条状态栏文字里，不然界面会一直停留在"正在加载"不动，看起来
-            # 像卡住了，其实这一步早就结束了。
-            self.stage.emit("正在扫描待定库存索引…")
-            summary_book = ShipmentSummaryBook(
-                summary_wb.active,
-                progress_callback=lambda done, total: self.progress.emit(
-                    "正在扫描待定库存索引", done, total
-                ),
-            )
-
             self.stage.emit("正在校验每一条分摊…")
             plan = build_plan(all_lines, parse_errors, lookup, purchase_book, self._ship_date)
 
             if plan.has_blocking_errors:
-                self.succeeded.emit((plan, None, purchase_wb, summary_wb, purchase_book, summary_book))
+                self.succeeded.emit((plan, None, purchase_wb, purchase_book))
                 return
 
-            result = run_and_capture_diff(
+            diff_table = run_and_capture_diff_purchase_only(
                 plan,
                 purchase_book,
-                summary_book,
                 progress_callback=lambda stage, done, total: self.progress.emit(stage, done, total),
             )
-            self.succeeded.emit((plan, result, purchase_wb, summary_wb, purchase_book, summary_book))
+            self.succeeded.emit((plan, diff_table, purchase_wb, purchase_book))
         except Exception as exc:
             self.failed.emit(str(exc))
 
 
 class _ConfirmWriteWorker(QThread):
-    # 备份失败和存盘失败要分开报——备份失败的话原文件还没动过一个字节，随便重试；存盘失败
-    # 的话备份已经生成了，但原文件可能已经写了一半，弹窗措辞不一样，所以拆成两个信号，
-    # 不跟 _PreviewWorker 共用一个笼统的 failed(str)。
-    succeeded = Signal(str, str)  # 采购订单汇总表备份文件名, 发货计划汇总表备份文件名
+    succeeded = Signal(str)  # 采购订单汇总表备份文件名
     backup_failed = Signal(str)
-    save_failed = Signal(str, str, str)  # 报错信息, 采购订单汇总表备份文件名, 发货计划汇总表备份文件名
+    save_failed = Signal(str, str)  # 报错信息, 采购订单汇总表备份文件名
     stage = Signal(str)
 
-    def __init__(self, purchase_path: str, summary_path: str, purchase_wb, summary_wb):
+    def __init__(self, purchase_path: str, purchase_wb):
         super().__init__()
         self._purchase_path = purchase_path
-        self._summary_path = summary_path
         self._purchase_wb = purchase_wb
-        self._summary_wb = summary_wb
 
     def run(self):
         self.stage.emit("正在备份原文件…")
         try:
             purchase_backup = backup_file(self._purchase_path)
-            summary_backup = backup_file(self._summary_path)
         except Exception as exc:
             self.backup_failed.emit(str(exc))
             return
@@ -206,16 +180,14 @@ class _ConfirmWriteWorker(QThread):
         try:
             self.stage.emit("正在写入采购订单汇总表…")
             self._purchase_wb.save(self._purchase_path)
-            self.stage.emit("正在写入发货计划汇总表…")
-            self._summary_wb.save(self._summary_path)
         except Exception as exc:
-            self.save_failed.emit(str(exc), purchase_backup.name, summary_backup.name)
+            self.save_failed.emit(str(exc), purchase_backup.name)
             return
 
-        self.succeeded.emit(purchase_backup.name, summary_backup.name)
+        self.succeeded.emit(purchase_backup.name)
 
 
-class ShipmentPlanApplyPanel(QWidget):
+class PurchaseAllocationApplyPanel(QWidget):
     def __init__(self):
         super().__init__()
         self._plan_entries: list[_PlanFileEntry] = []
@@ -224,16 +196,11 @@ class ShipmentPlanApplyPanel(QWidget):
         self._settings = QSettings()
 
         self._plan: Plan | None = None
-        self._result: PreviewResult | None = None
+        self._diff_table: DiffTable | None = None
         self._purchase_wb = None
-        self._summary_wb = None
         self._purchase_path = ""
-        self._summary_path = ""
         self._purchase_header_row = None
-        self._summary_header_row = None
 
-        # 内容可能很长（预览表格行数不定），整个面板放进一个纵向可滚动的区域里，而不是让每个
-        # 子控件（比如表格）各自滚动——外层容器统一上下滚，体验更接近正常网页/文档。
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(0, 0, 0, 0)
         scroll_area = QScrollArea()
@@ -245,29 +212,26 @@ class ShipmentPlanApplyPanel(QWidget):
         scroll_area.setWidget(content)
         layout = QVBoxLayout(content)
 
-        title = QLabel("发货计划自动更新")
+        title = QLabel("采购订单分摊更新")
         title.setStyleSheet("font-size: 16px; font-weight: bold;")
         layout.addWidget(title)
         note = QLabel(
-            "会真的修改采购订单汇总表和发货计划汇总表——请先点「生成预览」检查没问题，再点「确认写入」。"
-            "确认写入前会自动备份这两份文件的原始版本。"
+            "只会修改采购订单汇总表，不碰发货计划汇总表——请先点「生成预览」检查没问题，"
+            "再点「确认写入」。确认写入前会自动备份原文件。"
         )
         note.setWordWrap(True)
         layout.addWidget(note)
 
-        inputs_box = QGroupBox("长期维护的三张表")
+        inputs_box = QGroupBox("长期维护的两张表")
         inputs_layout = QVBoxLayout(inputs_box)
         row, self._product_edit = _file_picker_row("在售产品信息总表", self._browse_product)
         inputs_layout.addLayout(row)
         row, self._purchase_edit = _file_picker_row("采购订单汇总表", self._browse_purchase)
         inputs_layout.addLayout(row)
-        row, self._summary_edit = _file_picker_row("发货计划汇总表", self._browse_summary)
-        inputs_layout.addLayout(row)
         layout.addWidget(inputs_box)
 
         self._product_edit.setText(self._settings.value(_SETTINGS_KEY_PRODUCT, ""))
         self._purchase_edit.setText(self._settings.value(_SETTINGS_KEY_PURCHASE, ""))
-        self._summary_edit.setText(self._settings.value(_SETTINGS_KEY_SUMMARY, ""))
 
         plan_box = QGroupBox("运营提供的发货计划表（可以一次导入好几份）")
         plan_layout = QVBoxLayout(plan_box)
@@ -286,7 +250,7 @@ class ShipmentPlanApplyPanel(QWidget):
         layout.addWidget(plan_box)
 
         date_row = QHBoxLayout()
-        date_row.addWidget(QLabel("这次发货日期（采购汇总表写进这一列；发货计划汇总表的发货时间也用这个）"))
+        date_row.addWidget(QLabel("这次发货日期（采购汇总表写进这一列）"))
         self._date_edit = QDateEdit()
         self._date_edit.setCalendarPopup(True)
         default_date = _next_wednesday()
@@ -321,17 +285,10 @@ class ShipmentPlanApplyPanel(QWidget):
         self._error_text.setMaximumHeight(160)
         layout.addWidget(self._error_text)
 
-        # 预览就两张表，一张表一整行：红色是变化前、绿色是变化后，同一笔记录的前后状态紧挨着，
-        # 不用再左右对照着看。每张表上面有个筛选框，表里只有"备注"这一格能编辑，改了直接写回
-        # 对应的工作表（不用等"确认写入"再收集一遍）。这个组件是通用的，见 core/diff_preview.py。
         self._purchase_diff_group = DiffPreviewGroup(
             "采购订单汇总表 · 改动对比", key_fields=["订单号", "型号"], editable_field=_EDITABLE_FIELD
         )
         layout.addWidget(self._purchase_diff_group)
-        self._summary_diff_group = DiffPreviewGroup(
-            "发货计划汇总表 · 改动对比", key_fields=["采购单号", "型号"], editable_field=_EDITABLE_FIELD
-        )
-        layout.addWidget(self._summary_diff_group)
 
     # ---- 文件选择 ----
 
@@ -348,13 +305,6 @@ class ShipmentPlanApplyPanel(QWidget):
         if path:
             self._purchase_edit.setText(path)
             self._settings.setValue(_SETTINGS_KEY_PURCHASE, path)
-
-    def _browse_summary(self):
-        start_dir = str(Path(self._summary_edit.text()).parent) if self._summary_edit.text() else ""
-        path, _ = QFileDialog.getOpenFileName(self, "选择发货计划汇总表", start_dir, "Excel 文件 (*.xlsx)")
-        if path:
-            self._summary_edit.setText(path)
-            self._settings.setValue(_SETTINGS_KEY_SUMMARY, path)
 
     def _add_plan_files(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择运营提供的发货计划表", "", "Excel 文件 (*.xlsx)")
@@ -398,15 +348,12 @@ class ShipmentPlanApplyPanel(QWidget):
     def _start_preview(self):
         product_path = self._product_edit.text().strip()
         purchase_path = self._purchase_edit.text().strip()
-        summary_path = self._summary_edit.text().strip()
 
         missing = []
         if not product_path:
             missing.append("在售产品信息总表")
         if not purchase_path:
             missing.append("采购订单汇总表")
-        if not summary_path:
-            missing.append("发货计划汇总表")
         if not self._plan_entries:
             missing.append("发货计划表（至少一份）")
         if missing:
@@ -420,16 +367,15 @@ class ShipmentPlanApplyPanel(QWidget):
 
         self._preview_button.setEnabled(False)
         self._confirm_button.setEnabled(False)
-        self._progress.setRange(0, 0)  # 分摊笔数还没算出来之前先显示忙碌样式，算出来后会切成百分比
+        self._progress.setRange(0, 0)
         self._progress.show()
         self._error_text.hide()
         self._status_label.setText("正在处理……表格行数多的话可能要几分钟，请耐心等待，不要关闭窗口。")
-        self._clear_preview_tables()
+        self._purchase_diff_group.clear()
 
         self._purchase_path = purchase_path
-        self._summary_path = summary_path
 
-        self._worker = _PreviewWorker(product_path, purchase_path, summary_path, plan_files, ship_date)
+        self._worker = _PreviewWorker(product_path, purchase_path, plan_files, ship_date)
         self._worker.succeeded.connect(self._on_preview_succeeded)
         self._worker.failed.connect(self._on_preview_failed)
         self._worker.stage.connect(self._on_stage)
@@ -437,7 +383,6 @@ class ShipmentPlanApplyPanel(QWidget):
         self._worker.start()
 
     def _on_stage(self, text: str):
-        # 这一步算不出总数（或者本来就很快），先切回忙碌转圈样式，把具体在做什么写进状态栏。
         self._progress.setRange(0, 0)
         self._status_label.setText(text)
 
@@ -449,20 +394,14 @@ class ShipmentPlanApplyPanel(QWidget):
         self._progress.setValue(done)
         self._status_label.setText(f"{stage}：{done}/{total}")
 
-    def _clear_preview_tables(self):
-        self._purchase_diff_group.clear()
-        self._summary_diff_group.clear()
-
     def _on_preview_succeeded(self, payload):
-        plan, result, purchase_wb, summary_wb, purchase_book, summary_book = payload
+        plan, diff_table, purchase_wb, purchase_book = payload
         self._progress.hide()
         self._preview_button.setEnabled(True)
         self._plan = plan
-        self._result = result
+        self._diff_table = diff_table
         self._purchase_wb = purchase_wb
-        self._summary_wb = summary_wb
         self._purchase_header_row = purchase_book.header_row
-        self._summary_header_row = summary_book.header_row
 
         if plan.has_blocking_errors:
             self._status_label.setText(
@@ -482,18 +421,14 @@ class ShipmentPlanApplyPanel(QWidget):
             f"预览完成，共 {len(plan.items)} 条记录，涉及 {plan.total_allocations} 笔采购订单分摊。"
             "确认没问题的话点「确认写入」。"
         )
-        self._fill_preview(result)
+        self._fill_preview(diff_table)
         self._confirm_button.setEnabled(True)
         self._confirm_button.setText("确认写入")
 
-    def _fill_preview(self, result: PreviewResult):
+    def _fill_preview(self, diff_table: DiffTable):
         purchase_ws = self._purchase_wb.active
-        summary_ws = self._summary_wb.active
         purchase_remark_col = column_index_map(purchase_ws, self._purchase_header_row).get(_EDITABLE_FIELD)
-        summary_remark_col = column_index_map(summary_ws, self._summary_header_row).get(_EDITABLE_FIELD)
-
-        self._purchase_diff_group.fill(result.purchase, ws=purchase_ws, col_index=purchase_remark_col)
-        self._summary_diff_group.fill(result.summary, ws=summary_ws, col_index=summary_remark_col)
+        self._purchase_diff_group.fill(diff_table, ws=purchase_ws, col_index=purchase_remark_col)
 
     def _on_preview_failed(self, message: str):
         self._progress.hide()
@@ -510,43 +445,31 @@ class ShipmentPlanApplyPanel(QWidget):
         reply = QMessageBox.question(
             self,
             "确认写入",
-            "确定要把上面预览的改动写进：\n"
-            f"  {self._purchase_path}\n"
-            f"  {self._summary_path}\n\n"
+            f"确定要把上面预览的改动写进：\n  {self._purchase_path}\n\n"
             "写入前会先在原文件旁边自动生成一份备份。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        # 备份 + 存盘这两步（尤其是发货计划汇总表 wb.save()，实测大表要 8-12 秒）之前是直接在
-        # 界面主线程上跑的，完全没有进度提示，界面会看起来像卡死了一样（Windows 甚至可能弹
-        # "未响应"）——真实反馈过这个问题，改成跟"生成预览"一样放到后台线程里跑，加上进度条。
-        # 预览按钮这时候也要禁用：这一步还在改 self._purchase_wb/self._summary_wb 指向的这两个
-        # workbook 对象，这时候如果点"生成预览"重新起一批新的分摊，会跟正在存盘的这两个对象
-        # 冲突。
         self._preview_button.setEnabled(False)
         self._confirm_button.setEnabled(False)
         self._progress.setRange(0, 0)
         self._progress.show()
         self._status_label.setText("正在写入……请耐心等待，不要关闭窗口。")
 
-        self._confirm_worker = _ConfirmWriteWorker(
-            self._purchase_path, self._summary_path, self._purchase_wb, self._summary_wb
-        )
+        self._confirm_worker = _ConfirmWriteWorker(self._purchase_path, self._purchase_wb)
         self._confirm_worker.succeeded.connect(self._on_confirm_succeeded)
         self._confirm_worker.backup_failed.connect(self._on_backup_failed)
         self._confirm_worker.save_failed.connect(self._on_save_failed)
         self._confirm_worker.stage.connect(self._on_stage)
         self._confirm_worker.start()
 
-    def _on_confirm_succeeded(self, purchase_backup_name: str, summary_backup_name: str):
+    def _on_confirm_succeeded(self, purchase_backup_name: str):
         self._progress.hide()
         self._preview_button.setEnabled(True)
-        self._status_label.setText(f"已写入。备份文件：{purchase_backup_name} / {summary_backup_name}")
+        self._status_label.setText(f"已写入。备份文件：{purchase_backup_name}")
         self._confirm_button.setText("已写入")
-        # 特意不重新 setEnabled(True)——写完就写完了，留着"已写入"这个禁用状态的按钮，
-        # 防止手滑再点一次把同样的改动重复写进去。
 
     def _on_backup_failed(self, message: str):
         self._progress.hide()
@@ -555,7 +478,7 @@ class ShipmentPlanApplyPanel(QWidget):
         self._status_label.setText("写入失败，见弹窗说明。")
         QMessageBox.critical(self, "备份失败", f"没能先备份原文件，写入已取消：{message}")
 
-    def _on_save_failed(self, message: str, purchase_backup_name: str, summary_backup_name: str):
+    def _on_save_failed(self, message: str, purchase_backup_name: str):
         self._progress.hide()
         self._preview_button.setEnabled(True)
         self._confirm_button.setEnabled(True)
@@ -564,15 +487,11 @@ class ShipmentPlanApplyPanel(QWidget):
             self,
             "写入失败",
             f"存盘失败：{message}\n\n"
-            f"备份文件还在（{purchase_backup_name} / {summary_backup_name}），"
-            "原文件可能已经部分改动，建议手动检查。",
+            f"备份文件还在（{purchase_backup_name}），原文件可能已经部分改动，建议手动检查。",
         )
 
     def stop_running_tasks(self):
         if self._worker is not None and self._worker.isRunning():
             self._worker.wait(5000)
         if self._confirm_worker is not None and self._confirm_worker.isRunning():
-            # 存盘这一步中途打断风险比预览那边大得多——预览只是丢掉内存里的计算结果，这里
-            # 打断可能正好卡在 wb.save() 写到一半，宁可多等一会儿也不能像预览那样只等 5 秒
-            # 就撒手不管。
             self._confirm_worker.wait(30000)

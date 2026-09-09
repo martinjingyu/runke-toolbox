@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 from dataclasses import dataclass, field
 
 from copy import copy
@@ -28,7 +29,28 @@ from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.utils.cell import range_boundaries
 from openpyxl.worksheet.worksheet import Worksheet
 
-from .column_utils import HeaderNotFoundError, column_index_map, find_header_row, require_columns
+from .column_utils import (
+    HeaderNotFoundError,
+    column_index_map,
+    find_header_row,
+    require_columns,
+    unmerge_overlapping_columns,
+)
+
+_FORMULA_REF_RE = re.compile(r"([A-Za-z]{1,3})(\d+)")
+
+
+def _reindex_formula_column(formula: str, old_col: int, new_col: int) -> str:
+    # 精确替换：只把公式里等于 old_col 这一列的引用换成 new_col，其它列号原样保留——用在
+    # "把一个格子原样搬到隔壁列"这种场景，不是"整个区间跟着挪"（那个是 _rewrite_remaining_
+    # formulas 在插入完之后统一按新的列范围重写，不靠这里的逐格搬运）。
+    def repl(m: re.Match) -> str:
+        letters, digits = m.group(1), m.group(2)
+        if column_index_from_string(letters.upper()) == old_col:
+            return f"{get_column_letter(new_col)}{digits}"
+        return m.group(0)
+
+    return _FORMULA_REF_RE.sub(repl, formula)
 
 FIXED_HEADERS = ["订单号", "采购日期", "型号", "订单数量", "数量单位", "未出货数量"]
 SUB_HEADER_LABEL = "出货时间"
@@ -167,6 +189,49 @@ class PurchaseBook:
         outcome.shortfall = remaining_need
         return outcome
 
+    def find_date_column(self, target_date: dt.date) -> int | None:
+        """只读查找，不创建——"发货计划汇总表更新"用来确认「采购订单分摊更新」是不是已经把
+        这一天的分摊写进采购表了；找不到就说明这份采购表还不是"用过的"，不能拿来重放分摊
+        结果（见 allocate_recorded 的说明）。
+        """
+        for c, d in self._real_date_columns():
+            if d == target_date:
+                return c
+        return None
+
+    def allocate_recorded(self, model: str, date_col: int, quantity_needed: int) -> AllocationOutcome:
+        """不按"还剩多少余量"重新计算分摊，而是直接读 date_col 这一天的日期列里，这个货号
+        名下每笔采购订单实际已经写了多少，按同样的先后顺序（采购日期从早到晚）依次分给
+        这一条发货计划——"发货计划汇总表更新"专用：那份采购表传进来的时候已经是「采购订单
+        分摊更新」写过的结果，这里只是把写死的分配结果读出来去匹配发货计划汇总表待定行该
+        对应哪个（采购单号, 型号），不能再用 allocate() 那套"按余量现算"的逻辑——余量在
+        写采购表那一步已经被这一批实际用掉了，这时候再按余量现算，同一货号有好几个不同
+        ZD 批次时算出来的拆分顺序会跟当初实际写的对不上，重新算一遍余量够不够也没有意义
+        （余量判断的时机是写采购表的时候，不是这里）。
+
+        row_obj.consumed_this_run 在这个方法里的含义是"这一天记录的量已经被这次重放消耗
+        了多少"，不是 allocate() 里"从余量里扣了多少"——这两套方法不会在同一个 PurchaseBook
+        实例上混用，字段复用不会互相干扰。
+        """
+        outcome = AllocationOutcome()
+        remaining_need = quantity_needed
+
+        for row_obj in self.by_model.get(model, []):
+            if remaining_need <= 0:
+                break
+            v = self.ws.cell(row=row_obj.row_index, column=date_col).value
+            recorded = int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+            avail = recorded - row_obj.consumed_this_run
+            if avail <= 0:
+                continue
+            take = min(avail, remaining_need)
+            row_obj.consumed_this_run += take
+            outcome.allocations.append(Allocation(row=row_obj, quantity=take))
+            remaining_need -= take
+
+        outcome.shortfall = remaining_need
+        return outcome
+
     # ---- 写入 ----
 
     def _real_date_columns(self) -> list[tuple[int, dt.date | None]]:
@@ -200,12 +265,21 @@ class PurchaseBook:
         # 落在右边的那一列）——旧列右移之后这个"左边列号"不会跟着变，插入完了正好能直接用。
         style_source = insert_at - 1 if insert_at - 1 >= self.date_col_start else None
 
-        self.ws.insert_cols(insert_at)
-        # insert_cols 只搬单元格本身，"整列"级别的设置（列宽等）和新插入的这一整列的格子样式
-        # （字体/填充/边框），都不会像 Excel 那样自动跟着处理——列宽挂在列号上，列号错位了但
-        # 设置没跟着挪；新插入的这一整列每一行都是没有任何格式的空白格子，直接看会很突兀。
+        # 不用 openpyxl 自带的 insert_cols()——它不管插入点在哪，内部都要把整张表 _cells
+        # 字典里的全部单元格先按列排一次序（跟 shipment_summary.py 里绕开 insert_rows() 是
+        # 同一个坑）；这张表 ws.max_column 常年被撑到 Excel 列数上限（某个很远的格子只是
+        # 留了点格式的假象，不是真的有这么多列有数据），实测这一步能跑到 166 秒。这里改成
+        # 只在真正有数据的列范围内（insert_at 到 remaining_col）搬。
+        #
+        # 真实表格里这一片区域出现过历史遗留的合并单元格（比如带过批注的格子）——合并区域里
+        # 非左上角的格子是 openpyxl 的 MergedCell，连 .value 都赋不了值，搬运之前得先拆开，
+        # 见 unmerge_overlapping_columns 的说明。
+        unmerge_overlapping_columns(self.ws, insert_at, self.remaining_col + 1)
+        self._shift_columns_right(insert_at, self.remaining_col)
         self._shift_column_dimensions(insert_at)
-        self._copy_column_style(insert_at, style_source if style_source is not None else insert_at + 1)
+        style_col = style_source if style_source is not None else insert_at + 1
+        self._copy_column_style(insert_at, style_col)
+        self._copy_row1_total_formula(insert_at, style_col)
 
         self.ws.cell(row=self.header_row, column=insert_at, value=dt.datetime.combine(target_date, dt.time()))
         self.ws.cell(row=self.sub_header_row, column=insert_at, value=SUB_HEADER_LABEL)
@@ -217,6 +291,32 @@ class PurchaseBook:
         self._sync_auto_filter()
 
         return insert_at
+
+    def _shift_columns_right(self, insert_at: int, real_last_col: int) -> None:
+        """把 [insert_at, real_last_col] 这个真正有数据的列区间整体右移一列，给新插入的
+        日期列腾位置，insert_at 这一列本身腾空。只在这个有限范围内搬（不是整张表 max_column），
+        从最右边的列开始往左处理，不然后面的赋值会覆盖掉还没读出来的旧值（跟
+        shipment_summary.py 里 _push_tail_row_down 从后往前处理是同一个道理，只是行列换了个
+        方向）。这张表的日期列/未出货数量列实测都是普通数值/在插入完之后会被
+        _rewrite_remaining_formulas() 整个重写的公式，不需要处理"公式里引用别的列"这种情况，
+        但为了不留坑，遇到公式还是按"引用自己这一列"的规则挪一下，不假设它一定是纯数值。
+        """
+        last_row = self.ws.max_row
+        for c in range(real_last_col, insert_at - 1, -1):
+            dest_c = c + 1
+            for r in range(1, last_row + 1):
+                src_cell = self.ws.cell(row=r, column=c)
+                value = src_cell.value
+                if isinstance(value, str) and value.startswith("="):
+                    value = _reindex_formula_column(value, c, dest_c)
+                dest_cell = self.ws.cell(row=r, column=dest_c)
+                dest_cell.value = value
+                if src_cell.has_style:
+                    dest_cell._style = copy(src_cell._style)
+        # 腾空的这一列（insert_at）还留着搬走之前的旧值，得显式清掉，不然后面写新日期列的时候
+        # 底下的数据行会看起来像是这一列本来就有历史数据。
+        for r in range(1, last_row + 1):
+            self.ws.cell(row=r, column=insert_at).value = None
 
     def _sync_auto_filter(self) -> None:
         # 插入新的日期列会让表格整体变宽一列，但 Excel 的筛选范围是写死在文件里的固定区间，
@@ -268,15 +368,26 @@ class PurchaseBook:
             dest_dim.width = src_dim.width
         for r in range(1, self.ws.max_row + 1):
             src_cell = self.ws.cell(row=r, column=src_col)
-            if not src_cell.has_style:
-                continue
             dest_cell = self.ws.cell(row=r, column=dest_col)
-            dest_cell.font = copy(src_cell.font)
-            dest_cell.fill = copy(src_cell.fill)
-            dest_cell.border = copy(src_cell.border)
-            dest_cell.alignment = copy(src_cell.alignment)
-            dest_cell.number_format = src_cell.number_format
-            dest_cell.protection = copy(src_cell.protection)
+            # 不管 src_cell 有没有"显式样式"（has_style）都要复制，不能跳过——插入点这一列
+            # 在插入之前可能残留着这张表 ws.max_column 被撑得远超实际数据范围导致的杂散格式
+            # （见上面 unmerge_overlapping_columns 附近的说明），如果 src 没样式就 continue
+            # 跳过不写，dest 会保留这些杂散格式不被清掉，插进来的新日期列格式会跟旁边列对不上
+            # （实测：日期头那一格会显示成裸数字，不是 m月d日 这种正常格式）。直接复制 _style
+            # 这个小整数数组（不经过 font/fill/... 这些高层属性），是 openpyxl 官方认可的搬运
+            # 方式，也比逐个属性复制快得多——跟 shipment_summary.py 里 _copy_row_with_reindex
+            # 用的是同一个手法。
+            dest_cell._style = copy(src_cell._style)
+
+    def _copy_row1_total_formula(self, dest_col: int, src_col: int) -> None:
+        # 第 1 行（表头上面那一行）是每一列自己的求和行（比如 =SUBTOTAL(9,BT4:BT1000732)），
+        # 新插入的日期列本该也有一份、只是列号换成自己——_copy_column_style 只搬样式不搬公式，
+        # 不补这一步的话新插入的这一列在第 1 行会一直是空的，Excel 里这一列的求和格看着像是
+        # 漏填了。src_col 的公式如果本身就不是"引用自己这一列"的求和公式（比如凑巧是空的、
+        # 或者是别的写法），就不猜、不硬造一个，保持这一格空着，跟 src 没有可抄的东西时一样。
+        src_formula = self.ws.cell(row=1, column=src_col).value
+        if isinstance(src_formula, str) and src_formula.startswith("="):
+            self.ws.cell(row=1, column=dest_col).value = _reindex_formula_column(src_formula, src_col, dest_col)
 
     def _rewrite_remaining_formulas(self) -> None:
         qty_letter = get_column_letter(self.order_qty_col)

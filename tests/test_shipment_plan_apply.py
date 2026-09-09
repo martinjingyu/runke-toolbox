@@ -7,12 +7,22 @@ from openpyxl.styles import Border, PatternFill, Side
 
 from core.diff_preview import GROUP_KEY
 from modules.logistics.shipment_plan_apply.column_utils import HeaderNotFoundError, resolve_cell_value
-from modules.logistics.shipment_plan_apply.diff import run_and_capture_diff
-from modules.logistics.shipment_plan_apply.planner import build_plan, apply_plan
+from modules.logistics.shipment_plan_apply.diff import (
+    run_and_capture_diff,
+    run_and_capture_diff_purchase_only,
+    run_and_capture_diff_summary_only,
+)
+from modules.logistics.shipment_plan_apply.planner import (
+    build_plan,
+    build_plan_from_recorded_allocations,
+    apply_plan,
+    apply_plan_purchase_only,
+    apply_plan_summary_only,
+)
 from modules.logistics.shipment_plan_apply.product_lookup import ProductLookupError, load_product_lookup
 from modules.logistics.shipment_plan_apply.purchase_book import PurchaseBook
 from modules.logistics.shipment_plan_apply.shipment_summary import ShipmentSummaryBook
-from modules.logistics.shipment_plan_apply.shipment_templates import parse_shipment_plan
+from modules.logistics.shipment_plan_apply.shipment_templates import PlanLine, parse_shipment_plan
 
 REAL_DATA_DIR = Path("/Users/jingyuhuang/Documents/Work/闰科/物流仓库/采购汇总+发货计划")
 
@@ -345,6 +355,46 @@ def test_purchase_book_insert_date_column_preserves_formatting(tmp_path):
     assert ws3.cell(3, mid_col).border.top.style == "thin"
 
 
+def test_purchase_book_insert_date_column_copies_number_format_and_row1_total(tmp_path):
+    # 回归测试：真实数据踩过的坑——真实表格第 1 行是表头上面那一行，每一列自己的求和公式
+    # （=SUBTOTAL(9,F4:F1000)这种），第 2 行才是表头（日期）。_copy_column_style 之前碰到
+    # "源格子没有显式样式（has_style 是 False）"就直接跳过不写，插入点这一列如果本来就带着
+    # ws.max_column 被撑大导致的杂散格式，新插入的日期头格子就会保留这份杂散格式，不是抄邻居
+    # 列该有的日期格式，Excel 里显示成一串裸数字，不是正常的日期；另外第 1 行的求和公式之前
+    # 完全没处理，新插入的列在第 1 行会一直空着。
+    path = tmp_path / "purchase.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append([None] * 5 + ["=SUBTOTAL(9,F4:F1000)", "=SUBTOTAL(9,G4:G1000)", None])  # row1：求和行
+    ws.append(["订单号", "采购日期", "型号", "订单数量", "数量单位", dt.datetime(2024, 1, 1), dt.datetime(2024, 2, 1), "未出货数量"])  # row2：表头
+    ws.append([None, None, None, None, None, "出货时间", "出货时间", None])  # row3：副表头
+    ws.append(["PO-EARLY", dt.datetime(2024, 1, 1), "M1", 100, "pcs", 20, None, "=D4-SUM(F4:G4)"])
+    ws.append(["PO-LATE", dt.datetime(2024, 6, 1), "M1", 50, "pcs", None, None, "=D5-SUM(F5:G5)"])
+
+    date_fmt = 'm"月"d"日";@'
+    ws.cell(row=2, column=6).number_format = date_fmt  # F2：已有日期列的表头，正常的日期格式
+    ws.cell(row=2, column=7).number_format = date_fmt  # G2：同上
+    wb.save(path)
+
+    wb2 = openpyxl.load_workbook(path, data_only=False)
+    ws2 = wb2.active
+    book = PurchaseBook(ws2)
+    mid_col = book.find_or_create_date_column(dt.date(2024, 1, 15))  # 插在 F,G 之间
+    wb2.save(path)
+
+    wb3 = openpyxl.load_workbook(path, data_only=False)
+    ws3 = wb3.active
+    from openpyxl.utils import get_column_letter
+
+    # 新插入列的表头格式要跟左边邻居（F）一致，不能是默认的 General
+    assert ws3.cell(row=2, column=mid_col).number_format == date_fmt
+
+    # 新插入列第 1 行要有一份求和公式，列号换成自己，行范围原样保留
+    assert ws3.cell(row=1, column=mid_col).value == f"=SUBTOTAL(9,{get_column_letter(mid_col)}4:{get_column_letter(mid_col)}1000)"
+    # 原来的 G 右移一列，它自己的求和公式也要跟着列号一起挪
+    assert ws3.cell(row=1, column=mid_col + 1).value == f"=SUBTOTAL(9,{get_column_letter(mid_col + 1)}4:{get_column_letter(mid_col + 1)}1000)"
+
+
 def test_purchase_book_missing_headers_names_the_table(tmp_path):
     path = tmp_path / "purchase.xlsx"
     wb = openpyxl.Workbook()
@@ -377,7 +427,7 @@ def _write_summary_book(path: Path):
     return wb
 
 
-def test_shipment_summary_insert_above_preserves_formatting(tmp_path):
+def test_shipment_summary_split_preserves_formatting(tmp_path):
     # 回归测试：真实文件是有格式的（字体、填充色、边框、行高），新插入的行要照抄模板行的格式，
     # 不能是一整行没有任何样式的空白格子；行高这种"整行"级别的设置也要跟着抄一份，不能丢。
     path = tmp_path / "summary.xlsx"
@@ -406,8 +456,8 @@ def test_shipment_summary_insert_above_preserves_formatting(tmp_path):
     wb3 = openpyxl.load_workbook(path)
     ws3 = wb3.active
     new_row, pending_row = changes[0].new_row, changes[0].pending_row
-    assert pending_row == 2  # 待定行原地不动
-    assert new_row == 4  # 最后一行（PO-2）不是合计行，新记录直接接在表格末尾
+    assert pending_row == 2  # 原来这一行原地转成已发货记录，不用挪位置
+    assert new_row == 4  # 最后一行（PO-2）不是合计行，剩下的待定库存直接接在表格末尾
     assert ws3.cell(new_row, 1).fill.fgColor.rgb == "00FFFF00"
     assert ws3.cell(new_row, 1).border.top.style == "thin"
     assert ws3.row_dimensions[new_row].height == 30
@@ -448,7 +498,7 @@ def test_shipment_summary_reuses_trailing_blank_rows_instead_of_leaving_a_gap(tm
     new_row = changes[0].new_row
     assert new_row == 4  # 紧挨着真实数据插入，不是跳到第 8 行末尾之后
     assert ws2.cell(row=new_row, column=1).value == "PO-1"
-    assert ws2.cell(row=new_row, column=5).value == 5
+    assert ws2.cell(row=new_row, column=5).value == 10  # 没扣完剩下的待定库存（15-5）
 
     # 再来一笔：应该接着用第 5 行（下一个空白行），不是又跳回第 4 行或者跳到最后
     changes2 = book.apply_shipment("PO-2", "M2", 2, "ZD1", dt.date(2026, 9, 1))
@@ -460,7 +510,7 @@ def test_shipment_summary_reuses_trailing_blank_rows_instead_of_leaving_a_gap(tm
         assert ws2.cell(row=r, column=1).value is None
 
 
-def test_shipment_summary_insert_above_reindexes_formulas(tmp_path):
+def test_shipment_summary_split_reindexes_formulas(tmp_path):
     path = tmp_path / "summary.xlsx"
     _write_summary_book(path)
     wb = openpyxl.load_workbook(path)
@@ -470,32 +520,59 @@ def test_shipment_summary_insert_above_reindexes_formulas(tmp_path):
     changes = book.apply_shipment("PO-1", "M1", 5, "ZD1", dt.date(2026, 9, 1))
     assert len(changes) == 1
     change = changes[0]
-    assert change.kind == "insert_above"
-    assert change.pending_row == 2  # 待定行原地不动，不用挪位置
-    assert change.new_row == 4  # 新记录插在表格最下面（原来合计行所在的位置）
+    assert change.kind == "insert_new_pending"
+    assert change.pending_row == 2  # 原来这一行原地转成已发货记录，不用挪位置
+    assert change.new_row == 4  # 剩下的待定库存插在表格最下面（原来合计行所在的位置）
     assert change.pending_remaining_after == 10
 
     wb.save(path)
     wb2 = openpyxl.load_workbook(path, data_only=False)
     ws2 = wb2.active
 
-    # 待定行原地：数量扣减，标签公式还是指向自己这一行，完全不用跟着改
-    assert ws2.cell(row=2, column=5).value == 10
-    assert ws2.cell(row=2, column=7).value == "待定"
+    # 原来这一行原地转成已发货记录：数量/ZD/发货时间/状态是新值，标签公式还是指向自己这一行
+    assert ws2.cell(row=2, column=5).value == 5  # 数量
+    assert ws2.cell(row=2, column=6).value == "ZD1"
+    assert ws2.cell(row=2, column=7).value == dt.datetime(2026, 9, 1)
     assert ws2.cell(row=2, column=17).value == "=+A2"
 
     # PO-2/M2 完全没被这次分摊碰到，还在原来的第 3 行，公式也没变
     assert ws2.cell(row=3, column=1).value == "PO-2"
     assert ws2.cell(row=3, column=17).value == "=+A3"
 
-    # 新插入的已发货记录：数量/ZD/发货时间/状态是新值，标签公式指向自己这一行（第 4 行）
-    assert ws2.cell(row=4, column=5).value == 5  # 数量
-    assert ws2.cell(row=4, column=6).value == "ZD1"
+    # 新插入的待定行：数量是没扣完剩下的量，发货时间还是"待定"，标签公式指向自己这一行（第 4 行）
+    assert ws2.cell(row=4, column=5).value == 10  # 数量
+    assert ws2.cell(row=4, column=7).value == "待定"
     assert ws2.cell(row=4, column=17).value == "=+A4"
 
     # 合计行被顶到第 5 行，区间引用的结束边界从 E3 扩到 E4，把新插入的这一行也算进合计里；
     # 起始边界 E2 不变——起点那一行（PO-1）本来就没挪位置。
     assert ws2.cell(row=5, column=5).value == "=SUBTOTAL(9,E2:E4)"
+
+
+def test_shipment_summary_writes_sku_into_label_column_not_huohao(tmp_path):
+    # 回归测试：真实表里踩过的坑——"标签"这一列本该是运营发货计划表里原始的 SKU，但因为
+    # 之前这一列没被当成要显式写的字段，是靠新行整行照抄模板行带过来的；而历史行的"标签"
+    # 经常是"=+A<自己这行>"（这份 fixture 是镜像"采购单号"，真实表里更多是镜像"型号"/货号）
+    # 这种公式，抄过去新行的"标签"也会跟着变成货号/别的东西，不是真正的 SKU。现在调用方传了
+    # sku，就该显式覆盖成这个值，不管模板行原来是公式还是别的什么。
+    path = tmp_path / "summary.xlsx"
+    _write_summary_book(path)  # 第 17 列是"标签"，PO-1/PO-2 两行原来都是"=+A<row>"公式
+    wb = openpyxl.load_workbook(path)
+    ws = wb.active
+    book = ShipmentSummaryBook(ws)
+
+    # 拆分：原来这一行（转成已发货记录）的标签要是传进去的 sku，不是模板行公式算出来的货号
+    changes = book.apply_shipment("PO-1", "M1", 5, "ZD1", dt.date(2026, 9, 1), sku="WM-TD-348")
+    pending_row = changes[0].pending_row
+    new_row = changes[0].new_row
+    assert ws.cell(row=pending_row, column=17).value == "WM-TD-348"
+    # 新插入的待定行没被 _set_explicit_fields 碰过，标签公式原样不动（只是行号跟着挪到新行）
+    assert ws.cell(row=new_row, column=17).value == "=+A4"
+
+    # 原地转正（convert_in_place）：同一行的标签也要被覆盖成传进去的 sku
+    changes2 = book.apply_shipment("PO-2", "M2", 6, "ZD1", dt.date(2026, 9, 1), sku="WM-TD-999")
+    pending_row2 = changes2[0].pending_row
+    assert ws.cell(row=pending_row2, column=17).value == "WM-TD-999"
 
 
 def test_shipment_summary_convert_in_place_when_exact_match(tmp_path):
@@ -566,7 +643,8 @@ def test_shipment_summary_blank_fields_actually_clear_stale_values(tmp_path):
     ws2 = wb2.active
     book = ShipmentSummaryBook(ws2)
 
-    # insert_above：新行是从待定行复制出来的，旧的 仓库/FBA/追踪/备注/货代/出货单/编号 都不该带过去
+    # 拆分：新插入的待定行是从原来那行复制出来的，旧的 仓库/FBA/追踪/备注/货代/出货单/编号
+    # 都不该带过去（还没决定怎么发，不该继承上一轮遗留的旧备注）
     changes = book.apply_shipment("PO-1", "M1", 5, "ZD1", dt.date(2026, 9, 1))
     new_row = changes[0].new_row
     for col in (9, 10, 11, 12, 13, 14, 16):  # 仓库/FBA ID/追踪编号/备注/货代/出货单号/编号
@@ -600,7 +678,9 @@ def test_shipment_summary_missing_box_capacity_still_updates_boxes(tmp_path):
     # 箱容缺失，箱数算不出来，应该是 None，不能留着模板行的旧箱数 999
     assert ws2.cell(row=new_row, column=3).value is None
     assert ws2.cell(row=pending_row, column=3).value is None
-    assert ws2.cell(row=pending_row, column=5).value == 10  # 数量本身照样正确扣减
+    # pending_row 原地转成已发货记录（数量=这次发的 5），new_row 是没扣完剩下的待定（数量=10）
+    assert ws2.cell(row=pending_row, column=5).value == 5
+    assert ws2.cell(row=new_row, column=5).value == 10
 
 
 def test_shipment_summary_pending_row_not_found_raises(tmp_path):
@@ -632,7 +712,7 @@ def test_shipment_summary_skips_zero_quantity_sibling_row(tmp_path):
 
     changes = book.apply_shipment("PO-DUP", "M1", 21, "ZD1", dt.date(2026, 9, 1))
     assert len(changes) == 1
-    assert changes[0].kind == "insert_above"
+    assert changes[0].kind == "insert_new_pending"
     assert changes[0].pending_remaining_after == 15
 
     ws2 = wb2.active
@@ -660,7 +740,7 @@ def test_shipment_summary_drains_across_multiple_pending_rows(tmp_path):
     assert len(changes) == 2
     assert changes[0].kind == "convert_in_place"  # 第一行 10 个正好扣完
     assert changes[0].quantity == 10
-    assert changes[1].kind == "insert_above"  # 第二行扣 15，剩 5 还待定
+    assert changes[1].kind == "insert_new_pending"  # 第二行扣 15，剩 5 还待定
     assert changes[1].quantity == 15
     assert changes[1].pending_remaining_after == 5
 
@@ -903,6 +983,215 @@ def test_planner_blocks_whole_batch_on_shortfall(tmp_path):
     assert plan.has_blocking_errors
     with pytest.raises(ValueError):
         apply_plan(plan, purchase_book, None)
+
+
+def test_apply_plan_purchase_only_accumulates_same_sku_different_zd(tmp_path):
+    # "采购订单分摊更新"（只写采购订单汇总表，不碰发货计划汇总表）：同一个货号在这一批里
+    # 可能因为分属不同的目的地（不同 ZD）拆成好几条 PlanItem，采购订单汇总表的日期列本来
+    # 就是"这一天一共发了多少"的汇总，不分 ZD——两笔分摊写到同一个日期列，应该叠加在一起
+    # （30+20=50），不能后一笔把前一笔覆盖掉。
+    product_path = tmp_path / "product.xlsx"
+    _write_product_info(product_path, [("AMZ-1", "RK-1", "M1")])
+    lookup = load_product_lookup(product_path)
+
+    purchase_path = tmp_path / "purchase.xlsx"
+    _write_purchase_book(purchase_path)
+    purchase_wb = openpyxl.load_workbook(purchase_path, data_only=False)
+    purchase_book = PurchaseBook(purchase_wb.active)
+
+    from modules.logistics.shipment_plan_apply.shipment_templates import PlanLine
+
+    lines = [
+        PlanLine(zd="CK-WM", sku_kind="RK", sku="RK-1", quantity=30, destination_label="US", source_row=2),
+        PlanLine(zd="LO-WM", sku_kind="RK", sku="RK-1", quantity=20, destination_label="CA", source_row=3),
+    ]
+    plan = build_plan(lines, [], lookup, purchase_book, dt.date(2026, 9, 1))
+    assert not plan.has_blocking_errors
+    assert plan.total_allocations == 2  # 两条 PlanItem，各自分摊一次
+
+    apply_plan_purchase_only(plan, purchase_book, None)
+
+    date_col = purchase_book.find_or_create_date_column(dt.date(2026, 9, 1))
+    early_row = next(r for r in purchase_book.rows if r.order_no == "PO-EARLY")
+    # 两笔分摊（先扣早的订单）都落在同一行、同一个日期列，写入的量是 30+20=50，不是后一笔
+    # 把前一笔覆盖成 20。
+    assert purchase_wb.active.cell(row=early_row.row_index, column=date_col).value == 50
+
+
+def test_run_and_capture_diff_purchase_only_reports_only_purchase_changes(tmp_path):
+    product_path = tmp_path / "product.xlsx"
+    _write_product_info(product_path, [("AMZ-1", "RK-1", "M1")])
+    lookup = load_product_lookup(product_path)
+
+    purchase_path = tmp_path / "purchase.xlsx"
+    _write_purchase_book(purchase_path)
+    purchase_wb = openpyxl.load_workbook(purchase_path, data_only=False)
+    purchase_book = PurchaseBook(purchase_wb.active)
+
+    from modules.logistics.shipment_plan_apply.shipment_templates import PlanLine
+
+    lines = [
+        PlanLine(zd="ZD1", sku_kind="RK", sku="RK-1", quantity=30, destination_label="ZD1", source_row=2)
+    ]
+    plan = build_plan(lines, [], lookup, purchase_book, dt.date(2026, 9, 1))
+    assert not plan.has_blocking_errors
+
+    diff_table = run_and_capture_diff_purchase_only(plan, purchase_book)
+    assert diff_table.before_rows[0]["未出货数量"] == 80
+    assert diff_table.after_rows[0]["未出货数量"] == 50
+
+
+def test_apply_plan_summary_only_does_not_touch_purchase_book(tmp_path):
+    # "发货计划汇总表更新"：purchase_book 只用来算分摊（决定这个货号该扣哪几笔采购订单），
+    # 不该往它里面写任何东西——不插日期列、不写累计出货量，调用方也不需要保存/备份它。
+    product_path = tmp_path / "product.xlsx"
+    _write_product_info(product_path, [("AMZ-1", "RK-1", "M1")])
+    lookup = load_product_lookup(product_path)
+
+    purchase_path = tmp_path / "purchase.xlsx"
+    _write_purchase_book(purchase_path)
+    purchase_wb = openpyxl.load_workbook(purchase_path, data_only=False)
+    purchase_book = PurchaseBook(purchase_wb.active)
+    purchase_max_column_before = purchase_wb.active.max_column
+
+    summary_path = tmp_path / "summary.xlsx"
+    summary_setup_wb = openpyxl.Workbook()
+    summary_ws = summary_setup_wb.active
+    headers = [
+        "采购单号", "型号", "箱数", "箱容", "数量", "ZD", "发货时间", "状态",
+        "仓库", "FBA ID", "追踪编号", "备注", "货代", "出货单号", "so", "编号",
+    ]
+    summary_ws.append(headers)
+    summary_ws.append(["PO-EARLY", "M1", 27, 3, 80, None, "待定", "未发货", None, None, None, None, None, None, None, None])
+    summary_setup_wb.save(summary_path)
+    summary_wb = openpyxl.load_workbook(summary_path)
+    summary_book = ShipmentSummaryBook(summary_wb.active)
+
+    from modules.logistics.shipment_plan_apply.shipment_templates import PlanLine
+
+    lines = [
+        PlanLine(zd="ZD1", sku_kind="RK", sku="RK-1", quantity=30, destination_label="ZD1", source_row=2)
+    ]
+    plan = build_plan(lines, [], lookup, purchase_book, dt.date(2026, 9, 1))
+    assert not plan.has_blocking_errors
+
+    apply_plan_summary_only(plan, summary_book)
+
+    # 采购订单汇总表完全没被改动：列数没变（没插日期列），日期区间里也没出现新的"出货时间"列
+    assert purchase_wb.active.max_column == purchase_max_column_before
+    assert all(d != dt.date(2026, 9, 1) for _, d in purchase_book._real_date_columns())
+
+    # 发货计划汇总表这边确实被扣了
+    assert summary_book.total_pending_quantity("PO-EARLY", "M1") == 50
+
+
+def test_run_and_capture_diff_summary_only_reports_only_summary_changes(tmp_path):
+    product_path = tmp_path / "product.xlsx"
+    _write_product_info(product_path, [("AMZ-1", "RK-1", "M1")])
+    lookup = load_product_lookup(product_path)
+
+    purchase_path = tmp_path / "purchase.xlsx"
+    _write_purchase_book(purchase_path)
+    purchase_wb = openpyxl.load_workbook(purchase_path, data_only=False)
+    purchase_book = PurchaseBook(purchase_wb.active)
+
+    summary_path = tmp_path / "summary.xlsx"
+    summary_setup_wb = openpyxl.Workbook()
+    summary_ws = summary_setup_wb.active
+    headers = [
+        "采购单号", "型号", "箱数", "箱容", "数量", "ZD", "发货时间", "状态",
+        "仓库", "FBA ID", "追踪编号", "备注", "货代", "出货单号", "so", "编号",
+    ]
+    summary_ws.append(headers)
+    summary_ws.append(["PO-EARLY", "M1", 27, 3, 80, None, "待定", "未发货", None, None, None, None, None, None, None, None])
+    summary_setup_wb.save(summary_path)
+    summary_wb = openpyxl.load_workbook(summary_path)
+    summary_book = ShipmentSummaryBook(summary_wb.active)
+
+    from modules.logistics.shipment_plan_apply.shipment_templates import PlanLine
+
+    lines = [
+        PlanLine(zd="ZD1", sku_kind="RK", sku="RK-1", quantity=30, destination_label="ZD1", source_row=2)
+    ]
+    plan = build_plan(lines, [], lookup, purchase_book, dt.date(2026, 9, 1))
+    assert not plan.has_blocking_errors
+
+    diff_table = run_and_capture_diff_summary_only(plan, summary_book)
+    assert len(diff_table.before_rows) == 1
+    assert diff_table.before_rows[0]["数量"] == 80
+    assert len(diff_table.after_rows) == 2  # 部分发货：新行 + 剩余待定行
+    assert {row["数量"] for row in diff_table.after_rows} == {30, 50}
+
+
+def test_build_plan_from_recorded_allocations_replays_already_written_purchase_columns(tmp_path):
+    # 模拟真实场景：先用「采购订单分摊更新」把这一批写进采购订单汇总表并存盘，「发货计划
+    # 汇总表更新」拿到的是这份已经写过的采购表——这时候不该再按余量现算一遍分摊（余量已经
+    # 被这一批扣过，重新算会报"余量不够"，但其实是这一批本来就该分摊到的量）。
+    product_path = tmp_path / "product.xlsx"
+    _write_product_info(product_path, [("AMZ-1", "RK-1", "M1")])
+    lookup = load_product_lookup(product_path)
+
+    purchase_path = tmp_path / "purchase.xlsx"
+    _write_purchase_book(purchase_path)
+
+    # 第一步：模拟「采购订单分摊更新」已经跑过——两条不同 ZD 的发货计划行（60 + 30），
+    # 按余量从早到晚分摊（PO-EARLY 剩 80，PO-LATE 剩 50），写入 2026-9-1 这一列，存盘。
+    setup_wb = openpyxl.load_workbook(purchase_path, data_only=False)
+    setup_book = PurchaseBook(setup_wb.active)
+    date_col = setup_book.find_or_create_date_column(dt.date(2026, 9, 1))
+    for qty in (60, 30):
+        outcome = setup_book.allocate("M1", qty)
+        assert outcome.shortfall == 0
+        for allocation in outcome.allocations:
+            setup_book.write_allocation(allocation, date_col)
+    setup_wb.save(purchase_path)
+    # PO-EARLY 这一天被写了 80（60 之后剩 20 给第二笔用满），PO-LATE 被写了 10。
+    early_row = next(r for r in setup_book.rows if r.order_no == "PO-EARLY")
+    late_row = next(r for r in setup_book.rows if r.order_no == "PO-LATE")
+    assert setup_wb.active.cell(row=early_row.row_index, column=date_col).value == 80
+    assert setup_wb.active.cell(row=late_row.row_index, column=date_col).value == 10
+
+    # 第二步：全新加载这份"已经用过"的采购表（模拟另一次工具运行、全新的 PurchaseBook 实例），
+    # 拿它去重放「发货计划汇总表更新」该匹配哪几笔采购订单——不能再用 allocate()，因为余量
+    # 早就被上面这一批用掉了，会误报"余量不够"。
+    purchase_wb = openpyxl.load_workbook(purchase_path, data_only=False)
+    purchase_book = PurchaseBook(purchase_wb.active)
+    assert purchase_book.by_model["M1"][0].remaining == 0  # PO-EARLY 余量确实已经是 0
+
+    lines = [
+        PlanLine(zd="CK-WM", sku_kind="RK", sku="RK-1", quantity=60, destination_label="US", source_row=2),
+        PlanLine(zd="LO-WM", sku_kind="RK", sku="RK-1", quantity=30, destination_label="CA", source_row=3),
+    ]
+    plan = build_plan_from_recorded_allocations(lines, [], lookup, purchase_book, dt.date(2026, 9, 1))
+
+    assert not plan.has_blocking_errors, [e for i in plan.items for e in i.errors] + plan.parse_errors
+    assert plan.total_allocations == 3  # 60 拆成 PO-EARLY 60；30 拆成 PO-EARLY 20 + PO-LATE 10
+    first_allocations = [(a.row.order_no, a.quantity) for a in plan.items[0].allocations]
+    second_allocations = [(a.row.order_no, a.quantity) for a in plan.items[1].allocations]
+    assert first_allocations == [("PO-EARLY", 60)]
+    assert second_allocations == [("PO-EARLY", 20), ("PO-LATE", 10)]
+
+
+def test_build_plan_from_recorded_allocations_errors_when_date_column_missing(tmp_path):
+    # 采购表还没被「采购订单分摊更新」用过（没有这一天的日期列）——不该去按余量现算，
+    # 应该明确提示"先用「采购订单分摊更新」把这一批写进去"。
+    product_path = tmp_path / "product.xlsx"
+    _write_product_info(product_path, [("AMZ-1", "RK-1", "M1")])
+    lookup = load_product_lookup(product_path)
+
+    purchase_path = tmp_path / "purchase.xlsx"
+    _write_purchase_book(purchase_path)
+    purchase_wb = openpyxl.load_workbook(purchase_path, data_only=False)
+    purchase_book = PurchaseBook(purchase_wb.active)
+
+    lines = [
+        PlanLine(zd="ZD1", sku_kind="RK", sku="RK-1", quantity=30, destination_label="ZD1", source_row=2)
+    ]
+    plan = build_plan_from_recorded_allocations(lines, [], lookup, purchase_book, dt.date(2026, 9, 1))
+
+    assert plan.has_blocking_errors
+    assert plan.items == []
+    assert any("先用「采购订单分摊更新」" in e for e in plan.parse_errors)
 
 
 # ---------------------------------------------------------------------------

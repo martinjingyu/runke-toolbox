@@ -6,20 +6,28 @@
 一个道理。
 
 单独扣一行的时候，只有两种结果：
-1. 这次要扣的数量 < 这一行剩余数量 -> 待定行原地不动，只把数量/箱数减掉这次扣的量（还是
-   待定，可能在后面的分摊里继续被扣），另外单独插一行"已发货"记录这次实际扣掉的量。
+1. 这次要扣的数量 < 这一行剩余数量 -> 这一行本身原地转成"已发货"记录（发货时间/ZD/标签等
+   按这次分摊改写，见 _set_explicit_fields）；剩下没扣的量单独插一行"待定"，放在表格最下面，
+   保留原来那批"还没决定去哪"的库存该有的样子（发货时间还是"待定"、状态还是"未发货"，其它
+   字段原样照抄）。
 2. 这次要扣的数量 = 这一行剩余数量（正好扣完）-> 不插入新行，直接把这一行的发货时间从"待定"
    改成这次的日期，其它字段按新行的规则原地更新。
+
+两种情况下，原来那一行(pending_row)最终都会变成"已发货"记录——这样"这个采购单号+型号名下
+最后一条记录"才始终代表当前还剩多少待定库存（如果还有的话，落在新插入、位置更靠后的那一行），
+不会出现"表格里越往下的记录反而是更早以前的已发货记录，真正的待定库存却夹在中间"这种容易让人
+看错的情况（真实数据踩过这个坑：人工翻表格找某个采购单号+型号还剩多少货，本能地看"最后一行"，
+结果最后一行是已发货记录，真正还没发的库存在前面某一行，很容易被当成"没货了"）。
 
 如果这个采购单号+型号名下所有待定行加起来都不够这次要发的数量，说明两张表本身的数据就对不上
 （比如采购汇总表显示还有货，发货计划汇总表这边却没记全），直接报错，不猜、不硬写。
 
-**新插入的"已发货"行放在哪里（重要，性能关键）**：不是插在被扣的那条待定行正上方，而是永远
+**新插入的"待定"行放在哪里（重要，性能关键）**：不是插在被扣的那条待定行正上方，而是永远
 插在整张表最下面——如果表格最后一行是"合计"行（比如「数量」列是
 `=SUBTOTAL(9,E6:E27947)` 这种区间汇总公式，"采购单号"/"型号"都是空的），就插在合计行上面
 （顺便把合计公式的区间边界往下扩一位，让新记录也算进合计里）；如果表格最后一行就是普通数据行，
-直接接在表格末尾，不用插入。已经跟用户确认过这个取舍：新记录不需要跟它对应的待定行挨在一起，
-只要保证"这个 SKU 名下最后一条待定记录"始终是对的就行。
+直接接在表格末尾，不用插入。已经跟用户确认过这个取舍：新记录不需要跟原来那条待定行挨在一起，
+只要保证"这个 SKU 名下最后一条记录"始终代表当前真实的待定库存就行。
 
 这么做是因为 openpyxl 的 `insert_rows()` 本身很贵，而且贵的地方不止是"插入点以下的单元格要
 逐个挪位置"——它内部搬单元格之前会把整张表 `_cells` 字典的全部坐标先排一次序（源码见
@@ -74,9 +82,9 @@ class InconsistentQuantityError(Exception):
 
 @dataclass
 class ShipmentSummaryChange:
-    kind: str  # "insert_above" 或 "convert_in_place"
-    pending_row: int
-    new_row: int | None  # kind=="insert_above" 时，新插入行的行号（在表格最下面，不挨着 pending_row）
+    kind: str  # "insert_new_pending"（拆分，没扣完）或 "convert_in_place"（正好扣完）
+    pending_row: int  # 这次分摊落在哪一行；处理完之后这一行会变成已发货记录（两种 kind 都一样）
+    new_row: int | None  # kind=="insert_new_pending" 时，新插入的"待定"行行号（在表格最下面）
     order_no: str
     model: str
     quantity: int
@@ -85,7 +93,7 @@ class ShipmentSummaryChange:
     boxes_exact: bool
     zd: str
     ship_date: dt.date
-    pending_remaining_after: int | None  # kind=="insert_above" 时，待定行扣完之后剩多少
+    pending_remaining_after: int | None  # kind=="insert_new_pending" 时，没扣完、留在新行里的量
 
 
 def _reindex_formula(formula: str, old_row: int, new_row: int) -> str:
@@ -125,6 +133,12 @@ class ShipmentSummaryBook:
         self.header_row = find_header_row(ws, REQUIRED_HEADERS, max_scan_rows=10, context="发货计划汇总表")
         cols = column_index_map(ws, self.header_row)
         self.col = require_columns(cols, REQUIRED_HEADERS, "发货计划汇总表")
+        # "标签"不是必须列（不是每张表都一定有），单独查一下、缺了就是 None——这一列该填的是
+        # 运营发货计划表里原始的 SKU（WM-SKU/AMZ-SKU/海外仓-SKU 那种，翻译前的写法），不是
+        # "型号"那一列的货号。之前这一列没被当成"要显式写"的字段，是靠新行整行照抄模板行带过来
+        # 的——真实表里很多历史行的"标签"存的是"=+B<自己这行>"这种公式，直接镜像"型号"（货号），
+        # 复制到新行照样会连着错，得显式写成真正的 SKU，不能指望模板行本来就是对的。
+        self._label_col = cols.get("标签")
         # openpyxl 的 ws.max_row / ws.max_column 不是缓存属性——每次访问都要把底层存储重新扫一遍
         # 找最大行号/列号（在几万行的表上，一次访问就是几万次内部循环）。这张表在这个 book 实例
         # 的生命周期里只会往下插行，不会插列，所以这里缓存一份、自己维护。
@@ -244,11 +258,14 @@ class ShipmentSummaryBook:
         raise ValueError(f"发货计划汇总表第 {row} 行的「数量」既不是数字也不是能识别的公式，读不出来")
 
     def apply_shipment(
-        self, order_no: str, model: str, quantity: int, zd: str, ship_date: dt.date
+        self, order_no: str, model: str, quantity: int, zd: str, ship_date: dt.date, sku: str = ""
     ) -> list[ShipmentSummaryChange]:
         """把 quantity 这么多货，从这个采购单号+型号名下的待定行里依次扣掉，可能一次扣完
         一行也可能要扣好几行（先到先扣），返回按处理顺序排列的改动列表。直接写，立刻生效，
         不用像插在待定行正上方那套做法一样得先攒一批最后统一处理。
+
+        sku：运营发货计划表里原始的 SKU 写法（翻译成货号之前的），要写进"标签"这一列（如果
+        这张表有这一列的话）——不能拿 model（货号）顶替，那是完全不同的两个东西。
         """
         total_available = self.total_pending_quantity(order_no, model)
         if not self.pending_rows(order_no, model):
@@ -284,7 +301,7 @@ class ShipmentSummaryBook:
                 )
             row_qty = self.read_quantity(row)
             take = min(row_qty, remaining_need)
-            changes.append(self._consume_row(row, take, order_no, model, zd, ship_date))
+            changes.append(self._consume_row(row, take, order_no, model, zd, ship_date, sku))
             remaining_need -= take
 
         return changes
@@ -316,51 +333,35 @@ class ShipmentSummaryBook:
         )
 
     def _consume_row(
-        self, pending_row: int, quantity: int, order_no: str, model: str, zd: str, ship_date: dt.date
+        self, pending_row: int, quantity: int, order_no: str, model: str, zd: str, ship_date: dt.date, sku: str = ""
     ) -> ShipmentSummaryChange:
         """从这一行待定库存里扣 quantity（调用方保证 0 < quantity <= 这一行当前数量）。"""
         pending_qty = self.read_quantity(pending_row)
         box_capacity = self.ws.cell(row=pending_row, column=self.col["箱容"]).value
         boxes, boxes_exact = _compute_boxes(quantity, box_capacity)
-
         remaining = pending_qty - quantity
+
+        new_row = None
         if remaining > 0:
-            # 拆分：待定行原地不动，只把数量/箱数往下调；已发货的这部分单独插一行，放在表格
-            # 最下面，不挨着这条待定行。
+            # 拆分：剩下没扣的量单独插一行"待定"，放在表格最下面，保留原来那批库存该有的样子；
+            # 原来这一行（pending_row）本身照旧走下面统一的 _set_explicit_fields，原地转成
+            # 已发货记录——见类文档，两种情况最终都是 pending_row 变成已发货记录。
             remaining_boxes, _ = _compute_boxes(remaining, box_capacity)
-            self.ws.cell(row=pending_row, column=self.col["数量"]).value = remaining
-            # remaining_boxes 箱容缺失/不合法时会是 None——用 .value = 显式赋值，不然
-            # ws.cell(..., value=None) 是个 no-op，待定行会留着拆分前的旧箱数，跟拆分后
-            # 变小的「数量」对不上。
-            self.ws.cell(row=pending_row, column=self.col["箱数"]).value = remaining_boxes
+            new_row = self._insert_pending_row(pending_row, remaining, remaining_boxes)
+            # 新插入的这一行还是"待定"，以后同一个采购单号+型号如果还有别的分摊要继续扣，
+            # 得让它也进入候选列表，不然会被当成不存在，之前拆出来的余量再也扣不到。
+            self._pending_index.setdefault((order_no, model), []).append(new_row)
 
-            new_row = self._insert_shipped_row(pending_row, order_no, model, quantity, boxes, zd, ship_date)
-
-            return ShipmentSummaryChange(
-                kind="insert_above",
-                pending_row=pending_row,
-                new_row=new_row,
-                order_no=order_no,
-                model=model,
-                quantity=quantity,
-                box_capacity=box_capacity,
-                boxes=boxes,
-                boxes_exact=boxes_exact,
-                zd=zd,
-                ship_date=ship_date,
-                pending_remaining_after=remaining,
-            )
-
-        # quantity == pending_qty：正好扣完这一行，原地转正，不用另外插行
-        self._set_explicit_fields(pending_row, order_no, model, quantity, boxes, zd, ship_date, NEW_STATUS)
+        self._set_explicit_fields(pending_row, order_no, model, quantity, boxes, zd, ship_date, NEW_STATUS, sku)
         self._blank_fields(pending_row)
         # 这一行发货时间从"待定"变成了具体日期，不再是待定库存，从索引里摘掉，不然后面
         # 同一个采购单号+型号再来一笔分摊，会把这一行当成还能扣的库存重复用。
         self._remove_from_pending_index(order_no, model, pending_row)
+
         return ShipmentSummaryChange(
-            kind="convert_in_place",
+            kind="insert_new_pending" if new_row is not None else "convert_in_place",
             pending_row=pending_row,
-            new_row=None,
+            new_row=new_row,
             order_no=order_no,
             model=model,
             quantity=quantity,
@@ -369,15 +370,15 @@ class ShipmentSummaryBook:
             boxes_exact=boxes_exact,
             zd=zd,
             ship_date=ship_date,
-            pending_remaining_after=None,
+            pending_remaining_after=remaining if new_row is not None else None,
         )
 
-    def _insert_shipped_row(
-        self, template_row: int, order_no: str, model: str, quantity: int, boxes, zd: str, ship_date: dt.date
-    ) -> int:
-        """新插一行"已发货"记录，产品相关的静态字段（长宽高/毛重/产品名称……）照抄
-        template_row（也就是被扣的那条待定行）——那是这个 SKU 的产品属性，公式列里"引用自己
-        这一行"的部分改成指向新插入的这一行。
+    def _insert_pending_row(self, template_row: int, remaining_qty: int, remaining_boxes) -> int:
+        """把这一行待定库存里没被这次分摊用完的部分，单独插一行"待定"记录——原来这一行
+        （template_row）本身会在 _consume_row 里被就地转成"已发货"记录，产品相关的静态字段
+        （长宽高/毛重/产品名称/采购单号/型号/发货时间="待定"/状态="未发货"……）照抄
+        template_row 转正之前的原样，公式列里"引用自己这一行"的部分改成指向新插入的这一行，
+        只把"数量"/"箱数"改成没扣完剩下的量。
 
         位置优先级（都是常数级代价，见类文档/__init__ 里 _next_blank_row 的说明）：
         1. 表格末尾如果还有没用完的历史遗留空白行，直接原地写进去，不用挪动任何东西；
@@ -400,7 +401,16 @@ class ShipmentSummaryBook:
             self._max_row = new_row
 
         self._copy_row_with_reindex(new_row, template_row)
-        self._set_explicit_fields(new_row, order_no, model, quantity, boxes, zd, ship_date, NEW_STATUS)
+        # 待定行不用像已发货记录那样整行改写——数量/箱数以外的字段（采购单号/型号/发货时间=
+        # 待定/状态=未发货/标签……）原样保留模板行转正之前的样子，本来就还是同一批"没决定去哪"
+        # 的库存。remaining_boxes 箱容缺失/不合法时会是 None——用 .value = 显式赋值，不然
+        # ws.cell(..., value=None) 是个 no-op，会留着模板行的旧箱数，跟拆分后变小的「数量」
+        # 对不上。
+        self.ws.cell(row=new_row, column=self.col["数量"]).value = remaining_qty
+        self.ws.cell(row=new_row, column=self.col["箱数"]).value = remaining_boxes
+        # 仓库/FBA ID/追踪编号/备注/货代/出货单号/编号这些是"这笔具体怎么发的"信息，模板行
+        # 上如果带着上一轮遗留的旧值（比如"无库存9"这种历史备注），不该原样复制给一条还没
+        # 决定怎么发的新待定行——见 _blank_fields 的说明。
         self._blank_fields(new_row)
         return new_row
 
@@ -463,7 +473,16 @@ class ShipmentSummaryBook:
             dest_dim.collapsed = src_dim.collapsed
 
     def _set_explicit_fields(
-        self, row: int, order_no: str, model: str, quantity: int, boxes, zd: str, ship_date: dt.date, status: str
+        self,
+        row: int,
+        order_no: str,
+        model: str,
+        quantity: int,
+        boxes,
+        zd: str,
+        ship_date: dt.date,
+        status: str,
+        sku: str = "",
     ) -> None:
         # 统一用 .value = 显式赋值，不用 ws.cell(..., value=X)——那种写法碰到 X 是 None 时
         # （比如箱容缺失、_compute_boxes 算不出箱数）什么都不会写，格子会留着模板行的旧箱数，
@@ -475,6 +494,14 @@ class ShipmentSummaryBook:
         self.ws.cell(row=row, column=self.col["ZD"]).value = zd
         self.ws.cell(row=row, column=self.col["发货时间"]).value = dt.datetime.combine(ship_date, dt.time())
         self.ws.cell(row=row, column=self.col["状态"]).value = status
+        # "标签"要填运营发货计划表里原始的 SKU，不是"型号"那一列的货号——两个是完全不同的
+        # 东西（型号是内部货号，标签是外部平台用的 SKU）。这一列本来是靠新行整行照抄模板行
+        # 带过来的，但真实表里历史行的"标签"经常是"=+B<自己这行>"这种公式，直接镜像"型号"，
+        # 抄过来的话新行的标签也会变成货号，是错的，所以这里必须显式写、不能指望模板行本来
+        # 就是对的。sku 传空字符串（调用方没传，比如没有原始 SKU 信息可用）就不碰这一列，
+        # 保留模板行原来抄过来的内容，不强行覆盖成空。
+        if self._label_col is not None and sku:
+            self.ws.cell(row=row, column=self._label_col).value = sku
 
     def _blank_fields(self, row: int) -> None:
         for field in BLANK_FIELDS:
