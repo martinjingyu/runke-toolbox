@@ -7,7 +7,13 @@
 也不需要备份或存盘（见 planner.py 的 apply_plan_summary_only）。
 
 不做预览、不弹二次确认——点一下「写入」就直接跑完整个流程，写入前仍然会先自动备份发货计划
-汇总表原文件，这是唯一保留的安全网；这一批发货计划有问题的话，会在写入前整批拦下来。
+汇总表原文件，这是唯一保留的安全网。如果这一批发货计划里有数据本身的问题（SKU 查不到货号、
+解析报错……），在写入之前就会整批拦下来；"采购表里记录的量不够"是唯一的例外——只把那一行
+跳过（不写、不算阻塞），其它行照常写入，跳过的行汇总成一张异常数据表格存在第一份发货计划表
+旁边（见 planner.py 的 write_skipped_items_report）。这种"记录不够"可能是这一行当初就是
+因为余量不够被「采购订单分摊更新」跳过了（正常），也可能是传错了采购表（数据对不上）——
+分不清是哪种，见 build_plan_from_recorded_allocations 的说明；真传错了的话异常表格里会是
+一整批"记录不够"，一眼就能看出来。
 界面结构跟"发货计划自动更新"保持一致，只是少了采购订单汇总表那一栏的写入/备份/存盘流程。
 """
 from __future__ import annotations
@@ -38,7 +44,7 @@ from PySide6.QtWidgets import (
 
 from core.backup import backup_file
 
-from .planner import apply_plan_summary_only, build_plan_from_recorded_allocations
+from .planner import apply_plan_summary_only, build_plan_from_recorded_allocations, write_skipped_items_report
 from .product_lookup import load_product_lookup
 from .purchase_book import PurchaseBook
 from .shipment_summary import ShipmentSummaryBook
@@ -73,10 +79,23 @@ def _file_picker_row(label_text: str, on_browse) -> tuple[QHBoxLayout, QLineEdit
     return row, line_edit
 
 
+# 表格显示顺序也按这个排——处理时确实是按亚马逊>沃尔玛>海外仓分摊的（见 planner.py 的
+# _TEMPLATE_PRIORITY），如果列表还是按运营原本添加文件的顺序摆，看着容易让人误以为是按
+# 那个顺序处理，所以加文件之后顺手把表格也重排一遍，眼见为实。
+_TEMPLATE_ORDER = {"amazon": 0, "walmart": 1, "overseas": 2}
+
+
+def _entry_priority(entry: "_PlanFileEntry") -> int:
+    return _TEMPLATE_ORDER.get(entry.effective_template_type, len(_TEMPLATE_ORDER))
+
+
 class _PlanFileEntry:
     def __init__(self, path: str, sheet_names: list[str], detected: str | None):
         self.path = path
         self.sheet_names = sheet_names
+        self.detected_template_type = detected  # 自动识别出来的模板——模板下拉框停在"自动
+        # 识别"没被人工改过的时候，排序要按这个来，不能看下拉框当前文字（那时候文字就是
+        # "自动识别"，映射不出具体模板）
         self.sheet_combo = QComboBox()
         self.sheet_combo.addItems(sheet_names)
         self.template_combo = QComboBox()
@@ -94,12 +113,33 @@ class _PlanFileEntry:
         label = self.template_combo.currentText()
         return _LABEL_TO_TEMPLATE.get(label)
 
+    @property
+    def effective_template_type(self) -> str | None:
+        # 人工在下拉框里明确选过的类型优先；没手动选过（还停在"自动识别"）就退回探测出来的
+        # 那个，两边都拿不到才是真的不认识，排到最后。
+        return self.template_type or self.detected_template_type
+
+    def rebuild_combos(self, sheet_text: str, template_text: str) -> None:
+        """重排表格时用——旧的 sheet_combo/template_combo 会随着 QTableWidget 清空整张表
+        一起被销毁（setCellWidget 挂上去的控件归表格所有），这里重新建一份新的，把原来
+        选的值（sheet_text/template_text）复原回去，不能指望旧控件还能继续用。
+        """
+        self.sheet_combo = QComboBox()
+        self.sheet_combo.addItems(self.sheet_names)
+        if sheet_text:
+            self.sheet_combo.setCurrentText(sheet_text)
+        self.template_combo = QComboBox()
+        self.template_combo.addItem(_AUTO_LABEL)
+        self.template_combo.addItems(list(_TEMPLATE_LABELS.values()))
+        if template_text:
+            self.template_combo.setCurrentText(template_text)
+
 
 class _WriteWorker(QThread):
     blocked = Signal(list)
     backup_failed = Signal(str)
     save_failed = Signal(str, str)  # 报错信息, 发货计划汇总表备份文件名
-    succeeded = Signal(str)  # 发货计划汇总表备份文件名
+    succeeded = Signal(str, int, str)  # 发货计划汇总表备份文件名, 跳过条数, 异常表格路径（没有就是空字符串）
     failed = Signal(str)
     stage = Signal(str)
     progress = Signal(str, int, int)
@@ -193,7 +233,18 @@ class _WriteWorker(QThread):
                 self.save_failed.emit(str(exc), summary_backup.name)
                 return
 
-            self.succeeded.emit(summary_backup.name)
+            # 异常表格是"锦上添花"的附加产物，不是这次写入成不成功的一部分——文件都已经存盘了，
+            # 这一步哪怕出问题也不该把整次操作报成失败，只是异常表格没生成而已。
+            report_path = ""
+            if plan.skipped_items:
+                first_plan_path = Path(self._plan_files[0][0])
+                try:
+                    written = write_skipped_items_report(plan.skipped_items, first_plan_path)
+                    report_path = str(written) if written is not None else ""
+                except Exception:
+                    report_path = ""
+
+            self.succeeded.emit(summary_backup.name, len(plan.skipped_items), report_path)
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -221,8 +272,10 @@ class ShipmentSummaryApplyPanel(QWidget):
         layout.addWidget(title)
         note = QLabel(
             "只会修改发货计划汇总表，不碰采购订单汇总表——点「写入」直接生效，不会再弹预览确认。"
-            "写入前会自动先备份发货计划汇总表原文件；这一批发货计划有问题的话，会在写入前整批"
-            "拦下来。"
+            "写入前会自动先备份发货计划汇总表原文件；这一批发货计划有数据问题的话，会在写入前"
+            "整批拦下来。重放时按亚马逊>沃尔玛>海外仓的顺序处理，哪一行在采购表里记录的量不够"
+            "（比如当初就是因为余量不够被跳过的）会被单独跳过（不算整批出错），跳过的行会汇总"
+            "成一张异常数据表格。"
         )
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -329,6 +382,23 @@ class ShipmentSummaryApplyPanel(QWidget):
 
             entry = _PlanFileEntry(path, sheet_names, detected)
             self._plan_entries.append(entry)
+
+        self._resort_plan_table()
+
+    def _resort_plan_table(self) -> None:
+        # 按亚马逊>沃尔玛>海外仓重排表格显示顺序，跟实际分摊处理的顺序看齐（见
+        # _TEMPLATE_ORDER 的说明）。旧控件会随着 setRowCount(0) 被销毁，先按 entry 对象本身
+        # 记下每个人当前选的 sheet/模板（必须在排序、清表之前记，晚了控件就没了），重排完
+        # 再用 rebuild_combos() 建一份新的、把选择复原。
+        selections_by_entry = {
+            id(entry): (entry.sheet_name, entry.template_combo.currentText()) for entry in self._plan_entries
+        }
+        self._plan_entries.sort(key=_entry_priority)
+
+        self._plan_table.setRowCount(0)
+        for entry in self._plan_entries:
+            sheet_text, template_text = selections_by_entry[id(entry)]
+            entry.rebuild_combos(sheet_text, template_text)
             self._append_plan_row(entry)
 
     def _append_plan_row(self, entry: _PlanFileEntry) -> None:
@@ -409,9 +479,13 @@ class ShipmentSummaryApplyPanel(QWidget):
         self._error_text.setPlainText("\n".join(error_lines))
         self._error_text.show()
 
-    def _on_succeeded(self, summary_backup_name: str):
+    def _on_succeeded(self, summary_backup_name: str, skipped_count: int, report_path: str):
         self._progress.hide()
-        self._status_label.setText(f"已写入。备份文件：{summary_backup_name}")
+        text = f"已写入。备份文件：{summary_backup_name}"
+        if skipped_count > 0:
+            text += f"\n有 {skipped_count} 行因为采购表里记录的量不够被跳过，没有写入。"
+            text += f"\n异常数据表格：{report_path}" if report_path else "\n（异常数据表格生成失败，跳过的记录只能自己核对）"
+        self._status_label.setText(text)
         self._write_button.setText("已写入")
 
     def _on_failed(self, message: str):

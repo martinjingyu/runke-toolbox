@@ -1061,6 +1061,38 @@ def test_write_skipped_items_report_creates_file_next_to_first_plan(tmp_path):
     assert row == ["海外仓计划.xlsx", 5, "海外仓", "RK", "RK-9", "TD-9", "LO-RK", 99, "货号「TD-9」还差 10 个，已跳过"]
 
 
+def test_write_skipped_items_report_does_not_overwrite_same_second_collision(tmp_path, monkeypatch):
+    # 时间戳只精确到秒——手滑连点，或者两个工具紧挨着跑、用的是同一份发货计划表，都可能在
+    # 同一秒内生成两份异常表格。撞了文件名要加序号后缀，不能静默覆盖前一份，不然前一批
+    # 跳过的记录会凭空消失，谁都不知道。这里把"现在几点"锁死成同一个值，确保真的撞上，
+    # 不靠运气赌两次调用是不是刚好落在同一秒里。
+    import datetime as real_dt
+    import types
+
+    from modules.logistics.shipment_plan_apply import planner as planner_module
+    from modules.logistics.shipment_plan_apply.planner import PlanItem, write_skipped_items_report
+    from modules.logistics.shipment_plan_apply.shipment_templates import PlanLine
+
+    frozen_now = real_dt.datetime(2026, 1, 1, 12, 0, 0)
+    monkeypatch.setattr(
+        planner_module, "dt", types.SimpleNamespace(datetime=types.SimpleNamespace(now=lambda: frozen_now))
+    )
+
+    first_plan_path = tmp_path / "计划.xlsx"
+    skipped_item = PlanItem(
+        line=PlanLine(zd="ZD1", sku_kind="RK", sku="RK-1", quantity=1, destination_label="ZD1", source_row=2),
+        skip_reason="测试用",
+    )
+
+    first_out = write_skipped_items_report([skipped_item], first_plan_path)
+    second_out = write_skipped_items_report([skipped_item], first_plan_path)
+
+    assert first_out != second_out
+    assert first_out.exists()
+    assert second_out.exists()
+    assert second_out.name.endswith("-2.xlsx")
+
+
 def test_build_plan_reports_missing_date_column_instead_of_inserting(tmp_path):
     # 日期列不存在的时候，build_plan 要在这里就报出来（进不了 apply 阶段），不能像早期版本
     # 那样在 apply 的时候现场插一列——见 purchase_book.py 顶部说明。
@@ -1277,6 +1309,94 @@ def test_build_plan_from_recorded_allocations_replays_already_written_purchase_c
     second_allocations = [(a.row.order_no, a.quantity) for a in plan.items[1].allocations]
     assert first_allocations == [("PO-EARLY", 60)]
     assert second_allocations == [("PO-EARLY", 20), ("PO-LATE", 10)]
+
+
+def test_build_plan_from_recorded_allocations_skips_shortfall_without_blocking_batch(tmp_path):
+    # 跟 build_plan 一样：采购表里记录的量不够，不再阻塞整批，只跳过这一行——最常见的原因
+    # 就是这一行当初在「采购订单分摊更新」那边就是因为余量不够被跳过的，采购表里根本没有
+    # 记这一行的量。同一批里其它行该怎么重放还怎么重放。
+    product_path = tmp_path / "product.xlsx"
+    _write_product_info(product_path, [("AMZ-1", "RK-1", "M1")])
+    lookup = load_product_lookup(product_path)
+
+    purchase_path = tmp_path / "purchase.xlsx"
+    _write_purchase_book(purchase_path)
+
+    # 模拟「采购订单分摊更新」跑过一批：只有 60 个被实际分摊写入（比如另外的 9999 个当时
+    # 因为余量不够被跳过了，采购表里完全没留下记录）。
+    setup_wb = openpyxl.load_workbook(purchase_path, data_only=False)
+    setup_book = PurchaseBook(setup_wb.active)
+    date_col = setup_book.require_date_column(dt.date(2026, 9, 1))
+    outcome = setup_book.allocate("M1", 60)
+    assert outcome.shortfall == 0
+    for allocation in outcome.allocations:
+        setup_book.write_allocation(allocation, date_col)
+    setup_wb.save(purchase_path)
+
+    purchase_wb = openpyxl.load_workbook(purchase_path, data_only=False)
+    purchase_book = PurchaseBook(purchase_wb.active)
+
+    lines = [
+        PlanLine(zd="CK-WM", sku_kind="RK", sku="RK-1", quantity=9999, destination_label="US", source_row=2),
+        PlanLine(zd="LO-WM", sku_kind="RK", sku="RK-1", quantity=60, destination_label="CA", source_row=3),
+    ]
+    plan = build_plan_from_recorded_allocations(lines, [], lookup, purchase_book, dt.date(2026, 9, 1))
+
+    assert not plan.has_blocking_errors
+    assert len(plan.skipped_items) == 1
+    skipped = plan.skipped_items[0]
+    assert skipped.line.quantity == 9999
+    assert skipped.allocations == []
+    assert "已跳过" in skipped.skip_reason
+
+    processed = next(item for item in plan.items if item.line.quantity == 60)
+    assert processed.skip_reason is None
+    assert sum(a.quantity for a in processed.allocations) == 60  # 回滚生效，第二条行分到满额
+
+
+def test_build_plan_from_recorded_allocations_prioritizes_amazon_then_overseas(tmp_path):
+    # 重放的时候也要按亚马逊>沃尔玛>海外仓重排——记录的量不够摊给所有行时，缺口应该落在
+    # 海外仓身上，跟 build_plan 那边的优先级保持一致，不能因为走的是重放这条路径就变了。
+    product_path = tmp_path / "product.xlsx"
+    _write_product_info(product_path, [("AMZ-1", "RK-1", "M1")])
+    lookup = load_product_lookup(product_path)
+
+    purchase_path = tmp_path / "purchase.xlsx"
+    _write_purchase_book(purchase_path)
+
+    # 只写入 40 个记录（模拟当初分摊到的量本来就只有这些）
+    setup_wb = openpyxl.load_workbook(purchase_path, data_only=False)
+    setup_book = PurchaseBook(setup_wb.active)
+    date_col = setup_book.require_date_column(dt.date(2026, 9, 1))
+    outcome = setup_book.allocate("M1", 40)
+    assert outcome.shortfall == 0
+    for allocation in outcome.allocations:
+        setup_book.write_allocation(allocation, date_col)
+    setup_wb.save(purchase_path)
+
+    purchase_wb = openpyxl.load_workbook(purchase_path, data_only=False)
+    purchase_book = PurchaseBook(purchase_wb.active)
+
+    # 故意把输入顺序反着排（海外仓在前、亚马逊在后），确认真正生效的是模板优先级。
+    lines = [
+        PlanLine(
+            zd="LO-RK", sku_kind="RK", sku="RK-1", quantity=30, destination_label="LO-RK",
+            source_row=2, template_type="overseas",
+        ),
+        PlanLine(
+            zd="US", sku_kind="AMZ", sku="AMZ-1", quantity=30, destination_label="US",
+            source_row=2, template_type="amazon",
+        ),
+    ]
+    plan = build_plan_from_recorded_allocations(lines, [], lookup, purchase_book, dt.date(2026, 9, 1))
+    assert not plan.has_blocking_errors
+
+    amazon_item = next(i for i in plan.items if i.line.template_type == "amazon")
+    overseas_item = next(i for i in plan.items if i.line.template_type == "overseas")
+    assert amazon_item.skip_reason is None
+    assert sum(a.quantity for a in amazon_item.allocations) == 30
+    assert overseas_item.skip_reason is not None
+    assert overseas_item.allocations == []
 
 
 def test_build_plan_from_recorded_allocations_errors_when_date_column_missing(tmp_path):

@@ -148,10 +148,16 @@ def build_plan_from_recorded_allocations(
     """"发货计划汇总表更新"专用——不按余量现算分摊，而是读采购表里 ship_date 那一天已经
     写了的量（「采购订单分摊更新」写的），按同样的先后顺序重放出"这条发货计划该冲抵哪笔
     采购订单"，只用来确定发货计划汇总表待定行该匹配哪个（采购单号, 型号），不再重新校验
-    余量够不够——那一步判断在写采购表的时候已经做过了，这里传进来的采购表就是已经用过的，
-    重复校验没有意义（见跟用户的讨论）。如果读出来的记录量对不上这批计划要的量，说明传
-    进来的采购表可能跟这批发货计划不是同一批，仍然会报错，但报的是"记录对不上"而不是
-    "余量不够"。
+    余量够不够——那一步判断在写采购表的时候已经做过了。
+
+    这里同一条发货计划表传的还是原始输入（运营的发货计划表本身不会因为「采购订单分摊更新"
+    跳过了某一行就自动消失），"记录的量不够"现在分不清到底是两种情况里的哪一种：① 这一行
+    当初就是因为余量不够被「采购订单分摊更新」跳过的（正常情况，见 build_plan 的说明）；
+    ② 传进来的采购表其实跟这批发货计划不是同一批（数据真的对不上）。既然分不清，就按跟
+    build_plan 一样的规则处理——跳过、不算整批的阻塞错误，把原因记到 item.skip_reason，
+    调用方会把这些行也汇总进异常数据表格（见 write_skipped_items_report）；真是传错了
+    采购表这种情况，异常表格里一整批都会是"记录不够"，人一眼就能看出来是文件传错了，不需要
+    靠这里硬报错去提醒。
     """
     items: list[PlanItem] = []
 
@@ -163,7 +169,12 @@ def build_plan_from_recorded_allocations(
         ]
         return Plan(ship_date=ship_date, items=items, parse_errors=parse_errors)
 
-    for line in lines:
+    # 跟 build_plan 一样按亚马逊>沃尔玛>海外仓重排——道理是一样的：如果这一批记录的量本身
+    # 就不够摊给所有行（不管是当初写入时就不够、还是这之后又有改动），谁先重放到就先分到，
+    # 跟原始写入时用的是同一套优先级，回放结果才跟"当初到底发生了什么"保持一致。
+    ordered_lines = sorted(lines, key=_template_priority)
+
+    for line in ordered_lines:
         item = PlanItem(line=line)
         huohao = lookup.resolve(line.sku_kind, line.sku)
         if huohao is None:
@@ -175,15 +186,20 @@ def build_plan_from_recorded_allocations(
 
         item.huohao = huohao
         outcome = purchase_book.allocate_recorded(huohao, date_col, line.quantity)
-        item.allocations = outcome.allocations
 
         if outcome.shortfall > 0:
-            item.errors.append(
+            # 见上面 docstring：分不清是"当初就被跳过"还是"传错了采购表"，统一按跳过处理，
+            # 回滚这次重放已经占用的记录量，不然会白白占掉后面同货号其它行本来能对上的量。
+            for allocation in outcome.allocations:
+                allocation.row.consumed_this_run -= allocation.quantity
+            item.skip_reason = (
                 f"{_line_label(line)}：货号「{huohao}」在采购订单汇总表 "
                 f"{ship_date.strftime('%Y-%m-%d')} 这一列记录的量加起来还差 {outcome.shortfall} 个，"
-                f"凑不够这次要发的 {line.quantity} 个——可能这份发货计划表跟当初"
-                "「采购订单分摊更新」用的不是同一批，请核对"
+                f"凑不够这次要发的 {line.quantity} 个（可能当初就是因为余量不够被跳过了，也可能"
+                "这份发货计划表跟当初「采购订单分摊更新」用的不是同一批），已跳过"
             )
+        else:
+            item.allocations = outcome.allocations
 
         items.append(item)
 
@@ -316,7 +332,10 @@ def write_skipped_items_report(skipped_items: list[PlanItem], first_plan_path: P
 
     没有任何被跳过的行就不生成文件，不然每次正常跑完都平白多出一个空表，反而让人分不清
     "这次真的有问题"还是"这个工具每次都会生成一个"。文件名带时间戳，避免同一天跑了好几批、
-    后一次的异常表把前一次的覆盖掉。
+    后一次的异常表把前一次的覆盖掉——时间戳精确到秒，真要是同一秒内跑了不止一次（比如手滑
+    连点，或者「采购订单分摊更新」跟「发货计划汇总表更新」紧挨着跑、用的是同一份发货计划表），
+    只精确到秒还是会撞上、静默覆盖掉前一份，所以撞了名字的话再加个序号后缀，直到找到一个
+    没被占用的文件名，不覆盖任何已有文件。
     """
     if not skipped_items:
         return None
@@ -344,6 +363,11 @@ def write_skipped_items_report(skipped_items: list[PlanItem], first_plan_path: P
         ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = 18
 
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    out_path = first_plan_path.parent / f"{first_plan_path.stem}-异常数据-{timestamp}.xlsx"
+    base_name = f"{first_plan_path.stem}-异常数据-{timestamp}"
+    out_path = first_plan_path.parent / f"{base_name}.xlsx"
+    suffix = 2
+    while out_path.exists():
+        out_path = first_plan_path.parent / f"{base_name}-{suffix}.xlsx"
+        suffix += 1
     wb.save(out_path)
     return out_path
