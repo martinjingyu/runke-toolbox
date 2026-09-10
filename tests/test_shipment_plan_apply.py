@@ -20,7 +20,7 @@ from modules.logistics.shipment_plan_apply.planner import (
     apply_plan_summary_only,
 )
 from modules.logistics.shipment_plan_apply.product_lookup import ProductLookupError, load_product_lookup
-from modules.logistics.shipment_plan_apply.purchase_book import PurchaseBook
+from modules.logistics.shipment_plan_apply.purchase_book import DateColumnNotFoundError, PurchaseBook
 from modules.logistics.shipment_plan_apply.shipment_summary import ShipmentSummaryBook
 from modules.logistics.shipment_plan_apply.shipment_templates import PlanLine, parse_shipment_plan
 
@@ -80,7 +80,7 @@ def test_resolve_cell_value_passes_through_plain_values():
 def _write_walmart_plan(path: Path) -> None:
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.append(["店铺", "RK-SKU", "GTIN", "WM-SKU", "Item name", "预计发货数量"])
+    ws.append(["店铺", "RK-SKU", "GTIN", "WM-SKU", "Item name", "数量"])
     ws.append(["CK-沃尔玛", "TD-348", "gtin1", "WM-1", "Table Lamp", 21])
     ws.append([None, "TD-392", "gtin2", "WM-2", "Table Lamp", 0])  # 数量为 0，应该报错
     ws.append([None, "TD-521", "gtin3", "WM-3", "Table Lamp", 30])
@@ -107,7 +107,7 @@ def test_parse_walmart_plan_maps_lo_shop_to_lo_wm(tmp_path):
     path = tmp_path / "walmart.xlsx"
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.append(["店铺", "RK-SKU", "GTIN", "WM-SKU", "Item name", "预计发货数量"])
+    ws.append(["店铺", "RK-SKU", "GTIN", "WM-SKU", "Item name", "数量"])
     ws.append(["SX-LO-沃尔玛", "TD-158", "gtin1", "WM-1", "Table Lamp", 15])
     wb.save(path)
 
@@ -120,7 +120,7 @@ def test_parse_walmart_plan_unrecognized_shop_name_reports_error(tmp_path):
     path = tmp_path / "walmart.xlsx"
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.append(["店铺", "RK-SKU", "GTIN", "WM-SKU", "Item name", "预计发货数量"])
+    ws.append(["店铺", "RK-SKU", "GTIN", "WM-SKU", "Item name", "数量"])
     ws.append(["未知店铺", "TD-158", "gtin1", "WM-1", "Table Lamp", 15])
     wb.save(path)
 
@@ -158,6 +158,35 @@ def test_parse_amazon_plan_splits_multi_destination_rows(tmp_path):
     assert all(l.sku_kind == "AMZ" for l in plan.lines)
 
 
+def test_parse_amazon_plan_ignores_missing_or_absent_shop_column(tmp_path):
+    # 亚马逊表不需要匹配"店铺"——只认 SKU + 站点列 + 数量，"店铺"缺失/整份表压根没有
+    # 这一列都不该报错（见 _parse_amazon 的说明，店铺只标注卖家账号，不影响 ZD/库存分摊）。
+    path = tmp_path / "amazon_no_shop_value.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["店铺", "SKU", "US", "CA"])
+    ws.append([None, "TD-CKD-206", 30, None])  # 这一行、以及它之前都没出现过店铺
+    wb.save(path)
+    plan = parse_shipment_plan(path, "Sheet")
+    assert not plan.errors
+    assert len(plan.lines) == 1
+    assert plan.lines[0].sku == "TD-CKD-206"
+    assert plan.lines[0].zd == "US"
+
+    path2 = tmp_path / "amazon_no_shop_column.xlsx"
+    wb2 = openpyxl.Workbook()
+    ws2 = wb2.active
+    ws2.append(["SKU", "US", "CA"])  # 整份表压根没有"店铺"这一列
+    ws2.append(["TD-CKD-206", 30, None])
+    wb2.save(path2)
+    plan2 = parse_shipment_plan(path2, "Sheet")
+    assert plan2.template_type == "amazon"
+    assert not plan2.errors
+    assert len(plan2.lines) == 1
+    assert plan2.lines[0].sku == "TD-CKD-206"
+    assert plan2.lines[0].zd == "US"
+
+
 def _write_overseas_plan(path: Path) -> None:
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -188,7 +217,7 @@ def test_parse_shipment_plan_missing_headers_names_the_file_and_sheet(tmp_path):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "9月计划"
-    ws.append(["店铺", "RK-SKU", "没有预计发货数量这一列"])
+    ws.append(["店铺", "RK-SKU", "没有数量这一列"])
     ws.append(["CK-沃尔玛", "TD-348", 21])
     wb.save(path)
 
@@ -257,13 +286,33 @@ def test_product_lookup_missing_headers_names_the_table(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _write_purchase_book(path: Path):
+def _write_purchase_book(path: Path, include_2026_09_01_col: bool = True):
+    # 日期列必须已经存在于表格里才能写（不再现场插入，见 purchase_book.py），所以这里除了
+    # 两个历史日期列（2024-01-01/2024-02-01），默认还预先放一个空的 2026-09-01 列——这是
+    # 这份测试文件里绝大多数发货计划用的日期，供 require_date_column/build_plan 找到并写入。
+    # include_2026_09_01_col=False：专门给"日期列压根不存在"这类场景用，别加这一列。
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.append(["订单号", "采购日期", "型号", "订单数量", "数量单位", dt.datetime(2024, 1, 1), dt.datetime(2024, 2, 1), "未出货数量"])
-    ws.append([None, None, None, None, None, "出货时间", "出货时间", None])
-    ws.append(["PO-EARLY", dt.datetime(2024, 1, 1), "M1", 100, "pcs", 20, None, "=D3-SUM(F3:G3)"])
-    ws.append(["PO-LATE", dt.datetime(2024, 6, 1), "M1", 50, "pcs", None, None, "=D4-SUM(F4:G4)"])
+    header = ["订单号", "采购日期", "型号", "订单数量", "数量单位", dt.datetime(2024, 1, 1), dt.datetime(2024, 2, 1)]
+    sub_header = [None, None, None, None, None, "出货时间", "出货时间"]
+    row3 = ["PO-EARLY", dt.datetime(2024, 1, 1), "M1", 100, "pcs", 20, None]
+    row4 = ["PO-LATE", dt.datetime(2024, 6, 1), "M1", 50, "pcs", None, None]
+    if include_2026_09_01_col:
+        header.append(dt.datetime(2026, 9, 1))
+        sub_header.append("出货时间")
+        row3.append(None)
+        row4.append(None)
+        remaining_range = "F{r}:H{r}"
+    else:
+        remaining_range = "F{r}:G{r}"
+    header.append("未出货数量")
+    sub_header.append(None)
+    row3.append(f"=D3-SUM({remaining_range.format(r=3)})")
+    row4.append(f"=D4-SUM({remaining_range.format(r=4)})")
+    ws.append(header)
+    ws.append(sub_header)
+    ws.append(row3)
+    ws.append(row4)
     wb.save(path)
     return wb
 
@@ -297,21 +346,18 @@ def test_purchase_book_reports_shortfall(tmp_path):
     assert outcome.shortfall == 500 - 80 - 50
 
 
-def test_purchase_book_insert_date_column_preserves_formula_and_unrelated_rows(tmp_path):
+def test_purchase_book_require_date_column_finds_existing_column(tmp_path):
     path = tmp_path / "purchase.xlsx"
     _write_purchase_book(path)
     wb = openpyxl.load_workbook(path, data_only=False)
     ws = wb.active
     book = PurchaseBook(ws)
 
-    # 插一个已有两列中间的日期
-    mid_col = book.find_or_create_date_column(dt.date(2024, 1, 15))
-    assert ws.cell(row=book.header_row, column=mid_col - 1).value == dt.datetime(2024, 1, 1)
-    assert ws.cell(row=book.header_row, column=mid_col + 1).value == dt.datetime(2024, 2, 1)
+    date_col = book.require_date_column(dt.date(2024, 1, 1))  # 已有的日期列 F
 
     outcome = book.allocate("M1", 10)
     for a in outcome.allocations:
-        book.write_allocation(a, mid_col)
+        book.write_allocation(a, date_col)
 
     wb.save(path)
     wb2 = openpyxl.load_workbook(path, data_only=False)
@@ -320,79 +366,17 @@ def test_purchase_book_insert_date_column_preserves_formula_and_unrelated_rows(t
     assert row2.initial_remaining == 80 - 10  # 重新加载后公式算出来的未出货数量要正确
 
 
-def test_purchase_book_insert_date_column_preserves_formatting(tmp_path):
-    # 回归测试：跟 shipment_summary 那边同一类问题——insert_cols 新建出来的整列没有任何格式，
-    # 列宽这种"整列"级别的设置也不会跟着 insert_cols 自动往右挪。
+def test_purchase_book_require_date_column_raises_when_missing(tmp_path):
+    # 日期列不会再自动插入——目标日期没有对应的列时必须直接报错，让人先手动把这一天的
+    # 日期列加好，不能由代码现场插一列（见模块文档：早期版本会插，但插入点右边的公式/格式
+    # 实际用起来还是出现过错位的问题）。
     path = tmp_path / "purchase.xlsx"
     _write_purchase_book(path)
     wb = openpyxl.load_workbook(path, data_only=False)
-    ws = wb.active
+    book = PurchaseBook(wb.active)
 
-    blue = PatternFill(start_color="0000FF", end_color="0000FF", fill_type="solid")
-    thin = Border(top=Side(style="thin"), bottom=Side(style="thin"))
-    for r in (1, 2, 3, 4):
-        for c in (6, 7):  # 两个已有日期列 F, G
-            ws.cell(row=r, column=c).fill = blue
-            ws.cell(row=r, column=c).border = thin
-    ws.column_dimensions["F"].width = 9.5
-    ws.column_dimensions["G"].width = 9.5
-    wb.save(path)
-
-    wb2 = openpyxl.load_workbook(path, data_only=False)
-    ws2 = wb2.active
-    book = PurchaseBook(ws2)
-    mid_col = book.find_or_create_date_column(dt.date(2024, 1, 15))  # 插在 F,G 之间
-    wb2.save(path)
-
-    wb3 = openpyxl.load_workbook(path, data_only=False)
-    ws3 = wb3.active
-    from openpyxl.utils import get_column_letter
-
-    assert ws3.column_dimensions["F"].width == 9.5  # 左边不受影响的列，原样不动
-    assert ws3.column_dimensions[get_column_letter(mid_col)].width == 9.5  # 新插入的列，抄了邻居的列宽
-    assert ws3.column_dimensions[get_column_letter(mid_col + 1)].width == 9.5  # 原来的 G 右移，列宽跟过去
-    assert ws3.cell(3, mid_col).fill.fgColor.rgb == "000000FF"
-    assert ws3.cell(3, mid_col).border.top.style == "thin"
-
-
-def test_purchase_book_insert_date_column_copies_number_format_and_row1_total(tmp_path):
-    # 回归测试：真实数据踩过的坑——真实表格第 1 行是表头上面那一行，每一列自己的求和公式
-    # （=SUBTOTAL(9,F4:F1000)这种），第 2 行才是表头（日期）。_copy_column_style 之前碰到
-    # "源格子没有显式样式（has_style 是 False）"就直接跳过不写，插入点这一列如果本来就带着
-    # ws.max_column 被撑大导致的杂散格式，新插入的日期头格子就会保留这份杂散格式，不是抄邻居
-    # 列该有的日期格式，Excel 里显示成一串裸数字，不是正常的日期；另外第 1 行的求和公式之前
-    # 完全没处理，新插入的列在第 1 行会一直空着。
-    path = tmp_path / "purchase.xlsx"
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.append([None] * 5 + ["=SUBTOTAL(9,F4:F1000)", "=SUBTOTAL(9,G4:G1000)", None])  # row1：求和行
-    ws.append(["订单号", "采购日期", "型号", "订单数量", "数量单位", dt.datetime(2024, 1, 1), dt.datetime(2024, 2, 1), "未出货数量"])  # row2：表头
-    ws.append([None, None, None, None, None, "出货时间", "出货时间", None])  # row3：副表头
-    ws.append(["PO-EARLY", dt.datetime(2024, 1, 1), "M1", 100, "pcs", 20, None, "=D4-SUM(F4:G4)"])
-    ws.append(["PO-LATE", dt.datetime(2024, 6, 1), "M1", 50, "pcs", None, None, "=D5-SUM(F5:G5)"])
-
-    date_fmt = 'm"月"d"日";@'
-    ws.cell(row=2, column=6).number_format = date_fmt  # F2：已有日期列的表头，正常的日期格式
-    ws.cell(row=2, column=7).number_format = date_fmt  # G2：同上
-    wb.save(path)
-
-    wb2 = openpyxl.load_workbook(path, data_only=False)
-    ws2 = wb2.active
-    book = PurchaseBook(ws2)
-    mid_col = book.find_or_create_date_column(dt.date(2024, 1, 15))  # 插在 F,G 之间
-    wb2.save(path)
-
-    wb3 = openpyxl.load_workbook(path, data_only=False)
-    ws3 = wb3.active
-    from openpyxl.utils import get_column_letter
-
-    # 新插入列的表头格式要跟左边邻居（F）一致，不能是默认的 General
-    assert ws3.cell(row=2, column=mid_col).number_format == date_fmt
-
-    # 新插入列第 1 行要有一份求和公式，列号换成自己，行范围原样保留
-    assert ws3.cell(row=1, column=mid_col).value == f"=SUBTOTAL(9,{get_column_letter(mid_col)}4:{get_column_letter(mid_col)}1000)"
-    # 原来的 G 右移一列，它自己的求和公式也要跟着列号一起挪
-    assert ws3.cell(row=1, column=mid_col + 1).value == f"=SUBTOTAL(9,{get_column_letter(mid_col + 1)}4:{get_column_letter(mid_col + 1)}1000)"
+    with pytest.raises(DateColumnNotFoundError, match="2024-01-15"):
+        book.require_date_column(dt.date(2024, 1, 15))
 
 
 def test_purchase_book_missing_headers_names_the_table(tmp_path):
@@ -985,6 +969,33 @@ def test_planner_blocks_whole_batch_on_shortfall(tmp_path):
         apply_plan(plan, purchase_book, None)
 
 
+def test_build_plan_reports_missing_date_column_instead_of_inserting(tmp_path):
+    # 日期列不存在的时候，build_plan 要在这里就报出来（进不了 apply 阶段），不能像早期版本
+    # 那样在 apply 的时候现场插一列——见 purchase_book.py 顶部说明。
+    product_path = tmp_path / "product.xlsx"
+    _write_product_info(product_path, [("AMZ-1", "RK-1", "M1")])
+    lookup = load_product_lookup(product_path)
+
+    purchase_path = tmp_path / "purchase.xlsx"
+    _write_purchase_book(purchase_path, include_2026_09_01_col=False)
+    purchase_wb = openpyxl.load_workbook(purchase_path, data_only=False)
+    purchase_book = PurchaseBook(purchase_wb.active)
+    purchase_max_column_before = purchase_wb.active.max_column
+
+    from modules.logistics.shipment_plan_apply.shipment_templates import PlanLine
+
+    lines = [
+        PlanLine(zd="ZD1", sku_kind="RK", sku="RK-1", quantity=30, destination_label="ZD1", source_row=2)
+    ]
+    plan = build_plan(lines, [], lookup, purchase_book, dt.date(2026, 9, 1))
+
+    assert plan.has_blocking_errors
+    assert plan.items == []
+    assert any("手动加好这一天的日期列" in e for e in plan.parse_errors)
+    # 没有任何东西被写进去，列数也没变——报错发生在任何写操作之前。
+    assert purchase_wb.active.max_column == purchase_max_column_before
+
+
 def test_apply_plan_purchase_only_accumulates_same_sku_different_zd(tmp_path):
     # "采购订单分摊更新"（只写采购订单汇总表，不碰发货计划汇总表）：同一个货号在这一批里
     # 可能因为分属不同的目的地（不同 ZD）拆成好几条 PlanItem，采购订单汇总表的日期列本来
@@ -1011,7 +1022,7 @@ def test_apply_plan_purchase_only_accumulates_same_sku_different_zd(tmp_path):
 
     apply_plan_purchase_only(plan, purchase_book, None)
 
-    date_col = purchase_book.find_or_create_date_column(dt.date(2026, 9, 1))
+    date_col = purchase_book.require_date_column(dt.date(2026, 9, 1))
     early_row = next(r for r in purchase_book.rows if r.order_no == "PO-EARLY")
     # 两笔分摊（先扣早的订单）都落在同一行、同一个日期列，写入的量是 30+20=50，不是后一笔
     # 把前一笔覆盖成 20。
@@ -1077,9 +1088,13 @@ def test_apply_plan_summary_only_does_not_touch_purchase_book(tmp_path):
 
     apply_plan_summary_only(plan, summary_book)
 
-    # 采购订单汇总表完全没被改动：列数没变（没插日期列），日期区间里也没出现新的"出货时间"列
+    # 采购订单汇总表完全没被改动：列数没变，2026-09-01 这一列（fixture 里本来就有）也
+    # 还是空的——apply_plan_summary_only 不写累计出货量，只是拿 purchase_book 算分摊。
     assert purchase_wb.active.max_column == purchase_max_column_before
-    assert all(d != dt.date(2026, 9, 1) for _, d in purchase_book._real_date_columns())
+    date_col = purchase_book.find_date_column(dt.date(2026, 9, 1))
+    assert all(
+        purchase_wb.active.cell(row=r.row_index, column=date_col).value is None for r in purchase_book.rows
+    )
 
     # 发货计划汇总表这边确实被扣了
     assert summary_book.total_pending_quantity("PO-EARLY", "M1") == 50
@@ -1138,7 +1153,7 @@ def test_build_plan_from_recorded_allocations_replays_already_written_purchase_c
     # 按余量从早到晚分摊（PO-EARLY 剩 80，PO-LATE 剩 50），写入 2026-9-1 这一列，存盘。
     setup_wb = openpyxl.load_workbook(purchase_path, data_only=False)
     setup_book = PurchaseBook(setup_wb.active)
-    date_col = setup_book.find_or_create_date_column(dt.date(2026, 9, 1))
+    date_col = setup_book.require_date_column(dt.date(2026, 9, 1))
     for qty in (60, 30):
         outcome = setup_book.allocate("M1", qty)
         assert outcome.shortfall == 0
@@ -1180,7 +1195,7 @@ def test_build_plan_from_recorded_allocations_errors_when_date_column_missing(tm
     lookup = load_product_lookup(product_path)
 
     purchase_path = tmp_path / "purchase.xlsx"
-    _write_purchase_book(purchase_path)
+    _write_purchase_book(purchase_path, include_2026_09_01_col=False)
     purchase_wb = openpyxl.load_workbook(purchase_path, data_only=False)
     purchase_book = PurchaseBook(purchase_wb.active)
 

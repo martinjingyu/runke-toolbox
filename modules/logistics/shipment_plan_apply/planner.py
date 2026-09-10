@@ -3,7 +3,8 @@
 - build_plan()：只读、只在内存里模拟分摊结果，完全不碰 openpyxl 的写操作，不管这一批发货
   计划有没有问题都能跑完、把所有问题一次性收集出来。
 - apply_plan()：只有在 build_plan() 判定"整批没有任何错误"的前提下才能调用，这时候才真的
-  往采购汇总表、发货计划汇总表的工作表对象里写数据（包括插入日期列、插入/转正发货计划行）。
+  往采购汇总表、发货计划汇总表的工作表对象里写数据（插入/转正发货计划行；日期列必须已经
+  存在，不会现场插入，见 build_plan 里对日期列的检查）。
 
 这样保证"分摊到一半才发现后面数量不够"不会导致文件被写了一半——build_plan 阶段发现任何
 问题，整批直接不进入 apply_plan，跟之前和业务确认过的"要么整批成功，要么什么都不改"一致。
@@ -58,6 +59,16 @@ def build_plan(
     ship_date: dt.date,
 ) -> Plan:
     items: list[PlanItem] = []
+
+    # 日期列必须已经在采购订单汇总表里手动加好——早期版本会在这里现场插入一新列，但插入会
+    # 挪动它右边所有列的位置，实际使用中出现过插入点右边的公式跟着错位的问题，现在改成只读
+    # 查找，找不到就在这里报出来，不进入 apply 阶段去写（见 purchase_book.py 顶部说明）。
+    if purchase_book.find_date_column(ship_date) is None:
+        parse_errors = list(parse_errors) + [
+            f"采购订单汇总表里还没有 {ship_date.strftime('%Y-%m-%d')} 这一天的日期列——"
+            "请先在表格里手动加好这一天的日期列，再重新更新"
+        ]
+        return Plan(ship_date=ship_date, items=items, parse_errors=parse_errors)
 
     for line in lines:
         item = PlanItem(line=line)
@@ -158,7 +169,7 @@ def apply_plan(
     if plan.has_blocking_errors:
         raise ValueError("这一批发货计划里还有没解决的错误，不能写入")
 
-    date_col = purchase_book.find_or_create_date_column(plan.ship_date)
+    date_col = purchase_book.require_date_column(plan.ship_date)
 
     total = plan.total_allocations
     done = 0
@@ -206,7 +217,7 @@ def apply_plan_purchase_only(
     if plan.has_blocking_errors:
         raise ValueError("这一批发货计划里还有没解决的错误，不能写入")
 
-    date_col = purchase_book.find_or_create_date_column(plan.ship_date)
+    date_col = purchase_book.require_date_column(plan.ship_date)
 
     total = plan.total_allocations
     done = 0

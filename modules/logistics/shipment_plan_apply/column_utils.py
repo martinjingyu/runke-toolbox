@@ -162,23 +162,6 @@ def unmerge_overlapping_rows(ws: Worksheet, min_row: int, max_row: int) -> None:
         ws.unmerge_cells(coord)
 
 
-def unmerge_overlapping_columns(ws: Worksheet, min_col: int, max_col: int) -> None:
-    """跟 unmerge_overlapping_rows 是同一个道理，只是方向换成列——把所有跟 [min_col, max_col]
-    这个列区间有重叠的已有合并单元格整个拆开。真实采购订单汇总表里就踩过这个坑：表头附近有
-    格子被合并过（比如某个历史遗留的批注格子），插入新的日期列要挪动这一片列区间的内容时，
-    合并区域里非左上角的格子是 openpyxl 的 MergedCell，连 .value 都赋不了值，会直接抛
-    AttributeError。这些列马上要按"每个格子独立搬"的方式整体右移，本来就不该继续跟一个
-    不相干的旧合并区域绑在一起，拆开是唯一正确的处理方式。
-    """
-    to_unmerge = [
-        str(merged_range)
-        for merged_range in ws.merged_cells.ranges
-        if merged_range.min_col <= max_col and merged_range.max_col >= min_col
-    ]
-    for coord in to_unmerge:
-        ws.unmerge_cells(coord)
-
-
 def reindex_formula(formula: str, old_row: int, new_row: int) -> str:
     """公式原文里，把"引用自己这一行"的单元格引用（行号正好等于 old_row 的）换成 new_row，
     其它行号的引用原样保留——给"整行复制到别的行"用的，不是"插入一行、后面所有行整体下移"

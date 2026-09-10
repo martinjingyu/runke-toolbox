@@ -6,8 +6,9 @@
 里分了几个不同的 ZD，最终都是汇总累加进采购订单汇总表同一个日期列（见 planner.py 的
 apply_plan_purchase_only）。
 
-界面结构、"预览再确认写入"两步走、写入前自动备份，都跟"发货计划自动更新"保持一致，只是少了
-发货计划汇总表那一栏输入和对应的改动对比表。
+不做预览、不弹二次确认——点一下「写入」就直接跑完整个流程，写入前仍然会先自动备份原文件，
+这是唯一保留的安全网；这一批发货计划有问题的话，会在写入前整批拦下来，不会写进去一半。
+界面结构跟"发货计划自动更新"保持一致，只是少了发货计划汇总表那一栏输入。
 """
 from __future__ import annotations
 
@@ -36,16 +37,11 @@ from PySide6.QtWidgets import (
 )
 
 from core.backup import backup_file
-from core.diff_preview import DiffPreviewGroup
 
-from .column_utils import column_index_map
-from .diff import DiffTable, run_and_capture_diff_purchase_only
-from .planner import Plan, build_plan
+from .planner import apply_plan_purchase_only, build_plan
 from .product_lookup import load_product_lookup
 from .purchase_book import PurchaseBook
 from .shipment_templates import PlanLine, list_sheet_names, parse_shipment_plan
-
-_EDITABLE_FIELD = "备注"
 
 _TEMPLATE_LABELS = {"walmart": "沃尔玛", "amazon": "亚马逊", "overseas": "海外仓"}
 _LABEL_TO_TEMPLATE = {v: k for k, v in _TEMPLATE_LABELS.items()}
@@ -97,8 +93,11 @@ class _PlanFileEntry:
         return _LABEL_TO_TEMPLATE.get(label)
 
 
-class _PreviewWorker(QThread):
-    succeeded = Signal(object)  # (plan, diff_table_or_None, purchase_wb, purchase_book)
+class _WriteWorker(QThread):
+    blocked = Signal(list)
+    backup_failed = Signal(str)
+    save_failed = Signal(str, str)  # 报错信息, 采购订单汇总表备份文件名
+    succeeded = Signal(str)  # 采购订单汇总表备份文件名
     failed = Signal(str)
     stage = Signal(str)
     progress = Signal(str, int, int)
@@ -145,61 +144,44 @@ class _PreviewWorker(QThread):
             plan = build_plan(all_lines, parse_errors, lookup, purchase_book, self._ship_date)
 
             if plan.has_blocking_errors:
-                self.succeeded.emit((plan, None, purchase_wb, purchase_book))
+                lines = list(plan.parse_errors)
+                for item in plan.items:
+                    lines.extend(item.errors)
+                self.blocked.emit(lines)
                 return
 
-            diff_table = run_and_capture_diff_purchase_only(
+            self.stage.emit("正在写入变化…")
+            apply_plan_purchase_only(
                 plan,
                 purchase_book,
-                progress_callback=lambda stage, done, total: self.progress.emit(stage, done, total),
+                progress_callback=lambda done, total: self.progress.emit("正在写入变化", done, total),
             )
-            self.succeeded.emit((plan, diff_table, purchase_wb, purchase_book))
+
+            self.stage.emit("正在备份原文件…")
+            try:
+                purchase_backup = backup_file(self._purchase_path)
+            except Exception as exc:
+                self.backup_failed.emit(str(exc))
+                return
+
+            try:
+                self.stage.emit("正在存盘采购订单汇总表…")
+                purchase_wb.save(self._purchase_path)
+            except Exception as exc:
+                self.save_failed.emit(str(exc), purchase_backup.name)
+                return
+
+            self.succeeded.emit(purchase_backup.name)
         except Exception as exc:
             self.failed.emit(str(exc))
-
-
-class _ConfirmWriteWorker(QThread):
-    succeeded = Signal(str)  # 采购订单汇总表备份文件名
-    backup_failed = Signal(str)
-    save_failed = Signal(str, str)  # 报错信息, 采购订单汇总表备份文件名
-    stage = Signal(str)
-
-    def __init__(self, purchase_path: str, purchase_wb):
-        super().__init__()
-        self._purchase_path = purchase_path
-        self._purchase_wb = purchase_wb
-
-    def run(self):
-        self.stage.emit("正在备份原文件…")
-        try:
-            purchase_backup = backup_file(self._purchase_path)
-        except Exception as exc:
-            self.backup_failed.emit(str(exc))
-            return
-
-        try:
-            self.stage.emit("正在写入采购订单汇总表…")
-            self._purchase_wb.save(self._purchase_path)
-        except Exception as exc:
-            self.save_failed.emit(str(exc), purchase_backup.name)
-            return
-
-        self.succeeded.emit(purchase_backup.name)
 
 
 class PurchaseAllocationApplyPanel(QWidget):
     def __init__(self):
         super().__init__()
         self._plan_entries: list[_PlanFileEntry] = []
-        self._worker: _PreviewWorker | None = None
-        self._confirm_worker: _ConfirmWriteWorker | None = None
+        self._worker: _WriteWorker | None = None
         self._settings = QSettings()
-
-        self._plan: Plan | None = None
-        self._diff_table: DiffTable | None = None
-        self._purchase_wb = None
-        self._purchase_path = ""
-        self._purchase_header_row = None
 
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(0, 0, 0, 0)
@@ -216,8 +198,8 @@ class PurchaseAllocationApplyPanel(QWidget):
         title.setStyleSheet("font-size: 16px; font-weight: bold;")
         layout.addWidget(title)
         note = QLabel(
-            "只会修改采购订单汇总表，不碰发货计划汇总表——请先点「生成预览」检查没问题，"
-            "再点「确认写入」。确认写入前会自动备份原文件。"
+            "只会修改采购订单汇总表，不碰发货计划汇总表——点「写入」直接生效，不会再弹预览确认。"
+            "写入前会自动先备份原文件；这一批发货计划有问题的话，会在写入前整批拦下来。"
         )
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -260,13 +242,9 @@ class PurchaseAllocationApplyPanel(QWidget):
         layout.addLayout(date_row)
 
         run_row = QHBoxLayout()
-        self._preview_button = QPushButton("生成预览")
-        self._preview_button.clicked.connect(self._start_preview)
-        run_row.addWidget(self._preview_button)
-        self._confirm_button = QPushButton("确认写入")
-        self._confirm_button.setEnabled(False)
-        self._confirm_button.clicked.connect(self._confirm_write)
-        run_row.addWidget(self._confirm_button)
+        self._write_button = QPushButton("写入")
+        self._write_button.clicked.connect(self._start_write)
+        run_row.addWidget(self._write_button)
         run_row.addStretch(1)
         layout.addLayout(run_row)
 
@@ -284,11 +262,6 @@ class PurchaseAllocationApplyPanel(QWidget):
         self._error_text.hide()
         self._error_text.setMaximumHeight(160)
         layout.addWidget(self._error_text)
-
-        self._purchase_diff_group = DiffPreviewGroup(
-            "采购订单汇总表 · 改动对比", key_fields=["订单号", "型号"], editable_field=_EDITABLE_FIELD
-        )
-        layout.addWidget(self._purchase_diff_group)
 
     # ---- 文件选择 ----
 
@@ -343,9 +316,9 @@ class PurchaseAllocationApplyPanel(QWidget):
         self._plan_entries.pop(idx)
         self._plan_table.removeRow(idx)
 
-    # ---- 预览 ----
+    # ---- 写入 ----
 
-    def _start_preview(self):
+    def _start_write(self):
         product_path = self._product_edit.text().strip()
         purchase_path = self._purchase_edit.text().strip()
 
@@ -365,19 +338,18 @@ class PurchaseAllocationApplyPanel(QWidget):
 
         plan_files = [(e.path, e.sheet_name, e.template_type) for e in self._plan_entries]
 
-        self._preview_button.setEnabled(False)
-        self._confirm_button.setEnabled(False)
+        self._write_button.setEnabled(False)
         self._progress.setRange(0, 0)
         self._progress.show()
         self._error_text.hide()
         self._status_label.setText("正在处理……表格行数多的话可能要几分钟，请耐心等待，不要关闭窗口。")
-        self._purchase_diff_group.clear()
 
-        self._purchase_path = purchase_path
-
-        self._worker = _PreviewWorker(product_path, purchase_path, plan_files, ship_date)
-        self._worker.succeeded.connect(self._on_preview_succeeded)
-        self._worker.failed.connect(self._on_preview_failed)
+        self._worker = _WriteWorker(product_path, purchase_path, plan_files, ship_date)
+        self._worker.blocked.connect(self._on_blocked)
+        self._worker.backup_failed.connect(self._on_backup_failed)
+        self._worker.save_failed.connect(self._on_save_failed)
+        self._worker.succeeded.connect(self._on_succeeded)
+        self._worker.failed.connect(self._on_failed)
         self._worker.stage.connect(self._on_stage)
         self._worker.progress.connect(self._on_progress)
         self._worker.start()
@@ -394,94 +366,33 @@ class PurchaseAllocationApplyPanel(QWidget):
         self._progress.setValue(done)
         self._status_label.setText(f"{stage}：{done}/{total}")
 
-    def _on_preview_succeeded(self, payload):
-        plan, diff_table, purchase_wb, purchase_book = payload
+    def _on_blocked(self, error_lines: list):
         self._progress.hide()
-        self._preview_button.setEnabled(True)
-        self._plan = plan
-        self._diff_table = diff_table
-        self._purchase_wb = purchase_wb
-        self._purchase_header_row = purchase_book.header_row
+        self._write_button.setEnabled(True)
+        self._status_label.setText(f"这一批有 {len(error_lines)} 处问题，全部列在下面，一个都没写入。")
+        self._error_text.setPlainText("\n".join(error_lines))
+        self._error_text.show()
 
-        if plan.has_blocking_errors:
-            self._status_label.setText(
-                f"这一批有 {len(plan.parse_errors) + sum(1 for i in plan.items if i.errors)} 处问题，"
-                "全部列在下面，一个都没写入。"
-            )
-            lines = list(plan.parse_errors)
-            for item in plan.items:
-                lines.extend(item.errors)
-            self._error_text.setPlainText("\n".join(lines))
-            self._error_text.show()
-            self._confirm_button.setEnabled(False)
-            return
-
-        self._error_text.hide()
-        self._status_label.setText(
-            f"预览完成，共 {len(plan.items)} 条记录，涉及 {plan.total_allocations} 笔采购订单分摊。"
-            "确认没问题的话点「确认写入」。"
-        )
-        self._fill_preview(diff_table)
-        self._confirm_button.setEnabled(True)
-        self._confirm_button.setText("确认写入")
-
-    def _fill_preview(self, diff_table: DiffTable):
-        purchase_ws = self._purchase_wb.active
-        purchase_remark_col = column_index_map(purchase_ws, self._purchase_header_row).get(_EDITABLE_FIELD)
-        self._purchase_diff_group.fill(diff_table, ws=purchase_ws, col_index=purchase_remark_col)
-
-    def _on_preview_failed(self, message: str):
+    def _on_succeeded(self, purchase_backup_name: str):
         self._progress.hide()
-        self._preview_button.setEnabled(True)
-        self._status_label.setText("预览失败，见弹窗说明。")
-        QMessageBox.critical(self, "预览失败", message)
-
-    # ---- 确认写入 ----
-
-    def _confirm_write(self):
-        if self._plan is None or self._plan.has_blocking_errors or self._purchase_wb is None:
-            return
-
-        reply = QMessageBox.question(
-            self,
-            "确认写入",
-            f"确定要把上面预览的改动写进：\n  {self._purchase_path}\n\n"
-            "写入前会先在原文件旁边自动生成一份备份。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        self._preview_button.setEnabled(False)
-        self._confirm_button.setEnabled(False)
-        self._progress.setRange(0, 0)
-        self._progress.show()
-        self._status_label.setText("正在写入……请耐心等待，不要关闭窗口。")
-
-        self._confirm_worker = _ConfirmWriteWorker(self._purchase_path, self._purchase_wb)
-        self._confirm_worker.succeeded.connect(self._on_confirm_succeeded)
-        self._confirm_worker.backup_failed.connect(self._on_backup_failed)
-        self._confirm_worker.save_failed.connect(self._on_save_failed)
-        self._confirm_worker.stage.connect(self._on_stage)
-        self._confirm_worker.start()
-
-    def _on_confirm_succeeded(self, purchase_backup_name: str):
-        self._progress.hide()
-        self._preview_button.setEnabled(True)
         self._status_label.setText(f"已写入。备份文件：{purchase_backup_name}")
-        self._confirm_button.setText("已写入")
+        self._write_button.setText("已写入")
+
+    def _on_failed(self, message: str):
+        self._progress.hide()
+        self._write_button.setEnabled(True)
+        self._status_label.setText("写入失败，见弹窗说明。")
+        QMessageBox.critical(self, "写入失败", message)
 
     def _on_backup_failed(self, message: str):
         self._progress.hide()
-        self._preview_button.setEnabled(True)
-        self._confirm_button.setEnabled(True)
+        self._write_button.setEnabled(True)
         self._status_label.setText("写入失败，见弹窗说明。")
         QMessageBox.critical(self, "备份失败", f"没能先备份原文件，写入已取消：{message}")
 
     def _on_save_failed(self, message: str, purchase_backup_name: str):
         self._progress.hide()
-        self._preview_button.setEnabled(True)
-        self._confirm_button.setEnabled(True)
+        self._write_button.setEnabled(True)
         self._status_label.setText("写入失败，见弹窗说明。")
         QMessageBox.critical(
             self,
@@ -492,6 +403,4 @@ class PurchaseAllocationApplyPanel(QWidget):
 
     def stop_running_tasks(self):
         if self._worker is not None and self._worker.isRunning():
-            self._worker.wait(5000)
-        if self._confirm_worker is not None and self._confirm_worker.isRunning():
-            self._confirm_worker.wait(30000)
+            self._worker.wait(30000)

@@ -1,7 +1,7 @@
 """生成"变化前/变化后"预览用的数据快照——只挑这次操作真正碰到的那些行，不是整张表甩过来。
 
-采购汇总表的行号在整个过程中不会变（这个表只插列，不插行），所以变化前/变化后可以直接按
-同一个行号去读。发货计划汇总表这边，待定行本身也不会挪位置（见 shipment_summary.py 顶部
+采购汇总表的行号、列号在整个过程中都不会变（日期列必须已经存在才能写，见 purchase_book.py
+的 require_date_column，不会再现场插列），所以变化前/变化后可以直接按同一个行号去读。发货计划汇总表这边，待定行本身也不会挪位置（见 shipment_summary.py 顶部
 说明——拆分只原地改数量，新插入的"已发货"记录固定放在表格最下面，不挨着待定行），所以这里
 也可以直接按行号读，不用像插在待定行正上方那套做法一样，还要另外模拟一遍行号随插入位移的
 过程。
@@ -53,11 +53,11 @@ def run_and_capture_diff(
     touched_purchase_rows = sorted({a.row.row_index for item in plan.items for a in item.allocations})
     rows_by_index = {r.row_index: r for r in purchase_book.rows}
 
-    # 表头 -> 列号的映射只在这里算一次，不要让 read_row() 每读一行都自己重新扫一遍表头——
-    # 真实表格 max_column 常年被撑得很大（openpyxl 的已知怪癖，见 column_utils.read_row 的
-    # 说明），改动的行数一多，反复重扫表头的开销会成倍放大，是这个预览功能实测卡顿的主要
-    # 原因。采购汇总表插入日期列之后列号会变，所以"改之前"和"改之后"要分别算一次；发货计划
-    # 汇总表这边全程不会插列，一份映射从头用到尾就够。
+    # 表头 -> 列号的映射只算一次，两张表全程都不会插列/插行导致列号变化（日期列必须已经
+    # 存在才能写，见 purchase_book.py 的 require_date_column），"改之前"和"改之后"可以共用
+    # 同一份映射，不用让 read_row() 每读一行都自己重新扫一遍表头——真实表格 max_column 常年
+    # 被撑得很大（openpyxl 的已知怪癖，见 column_utils.read_row 的说明），改动的行数一多，
+    # 反复重扫表头的开销会成倍放大，是这个预览功能实测卡顿的主要原因。
     purchase_mapping = column_index_map(purchase_book.ws, purchase_book.header_row)
     summary_mapping = column_index_map(summary_book.ws, summary_book.header_row)
 
@@ -113,11 +113,6 @@ def run_and_capture_diff(
     # apply_shipment 是直接写、立刻生效的（见 shipment_summary.py），change.new_row/
     # pending_row 已经是真实、最终的行号，不用再额外模拟位移。
 
-    # 表头要在 apply_plan 跑完之后才重新取一遍——apply_plan 可能会往采购汇总表插一个新的
-    # 日期列，插入前算的映射里不会有这一列（列号也可能因为插入整体右移），沿用旧的会导致
-    # 新写进去的量从预览里彻底消失，或者读到错位的列。发货计划汇总表全程不插列，映射不用
-    # 重算，沿用前面算好的那份。
-    purchase_mapping = column_index_map(purchase_book.ws, purchase_book.header_row)
     purchase_headers = list(purchase_mapping.keys())
     summary_headers = list(summary_mapping.keys())
 
@@ -209,9 +204,6 @@ def run_and_capture_diff_purchase_only(
         ),
     )
 
-    # 表头要在写完之后重新取一遍——可能往表格中间插了一个新的日期列，沿用写入前算的映射
-    # 会导致新写进去的量从预览里彻底消失，或者读到错位的列。
-    mapping = column_index_map(purchase_book.ws, purchase_book.header_row)
     headers = list(mapping.keys())
     after_rows = [_snapshot(r, rows_by_index[r].remaining, mapping) for r in touched_rows]
 

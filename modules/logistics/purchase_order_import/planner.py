@@ -485,8 +485,8 @@ def apply_plan(plan: Plan, purchase_ws: Worksheet, summary_ws: Worksheet, progre
     height_cols = all_columns_named(summary_ws, summary_book.header_row, "高")
 
     # 两张表实际有数据的列范围——不能拿 ws.max_column 当数，真实采购汇总表这张属性被撑到过
-    # 16384（某个很远的格子只是留了点格式，不代表真的有这么多列有数据，见 column_utils.py
-    # 里 unmerge_overlapping_columns 附近的说明）。这个范围既用来确认要写入的位置真的是空的
+    # 16384（某个很远的格子只是留了点格式，不代表真的有这么多列有数据）。这个范围既用来
+    # 确认要写入的位置真的是空的
     # （_assert_rows_blank），也传给下面的 copy_row()——copy_row 不传 max_col 的话会退回
     # ws.max_column，整行复制这一步就要陪着这 16384 列空跑一遍；实测这一项差异是「167ms/行」
     # 还是「36ms/行」的区别，导入的订单越多，这个不必要的常数因子被放大的次数就越多。

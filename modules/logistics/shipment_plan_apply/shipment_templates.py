@@ -1,9 +1,10 @@
 """解析运营提供的发货计划表——沃尔玛/亚马逊/海外仓三种模板，长得完全不一样：
 
-- 沃尔玛：一行一个 RK-SKU，一个"预计发货数量"列，"店铺"整份文件基本固定。
-- 亚马逊：一行一个 SKU（这里填的其实是 AMZ-SKU），"店铺"只在第一行填、后面靠合并单元格
-  沿用；SKU 后面跟着若干个目的地列（列头是国家代码，比如 US/CA），同一行可能好几个目的地
-  都有数量——每个目的地当成一条独立记录处理（各自扣库存、各自建一条待发货记录）。
+- 沃尔玛：一行一个 RK-SKU，一个"数量"列，"店铺"整份文件基本固定。
+- 亚马逊：一行一个 SKU（这里填的其实是 AMZ-SKU），后面跟着若干个目的地列（列头是站点/国家
+  代码，比如 US/CA），同一行可能好几个目的地都有数量——每个目的地当成一条独立记录处理（各自
+  扣库存、各自建一条待发货记录）。表里可能还带着一列"店铺"，但只认 SKU+站点+数量，不管
+  这一行属于哪个店铺——见 _parse_amazon 的说明。
 - 海外仓：一行一个"海外仓-SKU"，表头分两行：第一行是固定列名，第二行是各个目的仓的 ZD 编号；
   同一行可能好几个目的仓都有数量，处理方式跟亚马逊的多目的地一样，拆成独立记录。
 
@@ -23,8 +24,8 @@ from .column_utils import HeaderNotFoundError, column_index_map, find_header_row
 
 TemplateType = Literal["walmart", "amazon", "overseas"]
 
-WALMART_HEADERS = ["店铺", "RK-SKU", "预计发货数量"]
-AMAZON_HEADERS = ["店铺", "SKU"]
+WALMART_HEADERS = ["店铺", "RK-SKU", "数量"]
+AMAZON_HEADERS = ["SKU"]
 OVERSEAS_HEADERS = ["海外仓-SKU"]
 
 
@@ -125,7 +126,7 @@ def _map_walmart_shop_to_zd(shop: str) -> str | None:
 def _parse_walmart(ws: Worksheet, header_row: int) -> tuple[list[PlanLine], list[str]]:
     cols = column_index_map(ws, header_row)
     idx = require_columns(cols, WALMART_HEADERS, "沃尔玛发货计划表")
-    shop_col, sku_col, qty_col = idx["店铺"], idx["RK-SKU"], idx["预计发货数量"]
+    shop_col, sku_col, qty_col = idx["店铺"], idx["RK-SKU"], idx["数量"]
 
     lines: list[PlanLine] = []
     errors: list[str] = []
@@ -177,9 +178,15 @@ def _parse_walmart(ws: Worksheet, header_row: int) -> tuple[list[PlanLine], list
 
 
 def _parse_amazon(ws: Worksheet, header_row: int) -> tuple[list[PlanLine], list[str]]:
+    # 亚马逊表里没有沃尔玛/海外仓那种独立的"到站"编号列——目的地是靠 SKU 右边一整排站点/
+    # 国家代码列（US/CA……）本身区分的，哪一列填了数量就发去哪。表里经常还带着一列"店铺"
+    # （只在第一行填、后面靠合并单元格沿用），但那只是标注这批 SKU 挂在哪个卖家账号下，
+    # 不是到站信息，也不影响该扣哪笔库存——不需要识别它，只认 SKU + 站点列 + 数量；如果
+    # 这一列存在，把它从"目的地列"里排除掉就行（不然会被当成一个叫"店铺"的目的地）。
     cols = column_index_map(ws, header_row)
     idx = require_columns(cols, AMAZON_HEADERS, "亚马逊发货计划表")
-    shop_col, sku_col = idx["店铺"], idx["SKU"]
+    sku_col = idx["SKU"]
+    shop_col = cols.get("店铺")
     dest_cols = [
         (str(name), col) for name, col in cols.items() if col not in (shop_col, sku_col)
     ]
@@ -188,27 +195,16 @@ def _parse_amazon(ws: Worksheet, header_row: int) -> tuple[list[PlanLine], list[
 
     lines: list[PlanLine] = []
     errors: list[str] = []
-    last_zd: str | None = None
 
     for row_no, row in enumerate(ws.iter_rows(min_row=header_row + 1), start=header_row + 1):
-        shop_val = row[shop_col - 1].value
-        if shop_val is not None and str(shop_val).strip():
-            last_zd = str(shop_val).strip()
-
         sku_val = row[sku_col - 1].value
         if sku_val is None or not str(sku_val).strip():
             continue
         sku = str(sku_val).strip()
 
-        row_has_qty = False
         for dest_name, dest_col in dest_cols:
             qty_val = row[dest_col - 1].value
             if qty_val is None or qty_val == "":
-                continue
-            row_has_qty = True
-
-            if not last_zd:
-                errors.append(f"第{row_no}行（SKU={sku}，{dest_name}）：这一行之前都没有出现过店铺编号")
                 continue
 
             qty, err = _parse_quantity(qty_val)
@@ -218,9 +214,6 @@ def _parse_amazon(ws: Worksheet, header_row: int) -> tuple[list[PlanLine], list[
 
             lines.append(
                 PlanLine(
-                    # 亚马逊表里没有沃尔玛/海外仓那种独立的"到站"编号列——目的地是靠 SKU 右边
-                    # 一整排国家代码列（US/CA……）本身区分的，哪一列填了数量就发去哪，"店铺"
-                    # 只是用来定位这批 SKU 属于哪个店铺，不是到站信息，不能拿它当 ZD
                     zd=dest_name,
                     sku_kind="AMZ",
                     sku=sku,
@@ -229,8 +222,6 @@ def _parse_amazon(ws: Worksheet, header_row: int) -> tuple[list[PlanLine], list[
                     source_row=row_no,
                 )
             )
-
-        _ = row_has_qty  # 没有任何目的地填数量的行，直接跳过，不算错误（可能只是占位）
 
     return lines, errors
 
