@@ -38,6 +38,9 @@ class PlanLine:
     destination_label: str
     source_row: int
     source_file: str = ""  # 一次可以导入好几份发货计划表，这个字段用来在报错/预览里区分是哪一份
+    template_type: TemplateType | None = None  # 这一行来自哪种模板——分摊时按亚马逊/沃尔玛/
+    # 海外仓的优先顺序处理要用到，见 planner.py 里 _TEMPLATE_PRIORITY 的说明；由
+    # parse_shipment_plan 统一写入，调用方不用自己填
 
 
 @dataclass
@@ -95,6 +98,9 @@ def parse_shipment_plan(
         lines, errors = _parse_overseas(ws, context=context)
     else:
         raise ValueError(f"不认识的模板类型：{resolved_type}")
+
+    for line in lines:
+        line.template_type = resolved_type
 
     return ParsedPlan(template_type=resolved_type, lines=lines, errors=errors)
 

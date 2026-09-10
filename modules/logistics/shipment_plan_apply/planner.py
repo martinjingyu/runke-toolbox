@@ -6,8 +6,12 @@
   往采购汇总表、发货计划汇总表的工作表对象里写数据（插入/转正发货计划行；日期列必须已经
   存在，不会现场插入，见 build_plan 里对日期列的检查）。
 
-这样保证"分摊到一半才发现后面数量不够"不会导致文件被写了一半——build_plan 阶段发现任何
-问题，整批直接不进入 apply_plan，跟之前和业务确认过的"要么整批成功，要么什么都不改"一致。
+build_plan 阶段发现的问题分两种，处理方式不一样：SKU 查不到货号、解析报错这些是数据本身
+有问题，仍然会让整批直接不进入 apply_plan，跟之前和业务确认过的"要么整批成功，要么什么都
+不改"一致（见 Plan.has_blocking_errors）。"余量不够"是唯一的例外——只把这一行本身跳过
+（不分摊、不写），记进 PlanItem.skip_reason，不影响同一批里其它行照常写入；被跳过的行
+用 write_skipped_items_report() 单独汇总成一张异常数据表格，见 build_plan 里
+_TEMPLATE_PRIORITY 附近的说明。
 
 即使 apply_plan() 跑完，也只是改了内存里的 openpyxl Workbook 对象，实际磁盘上的文件要调用方
 自己在人工确认之后再 wb.save()——这个模块不负责存盘，也不负责备份。
@@ -16,6 +20,9 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field
+from pathlib import Path
+
+import openpyxl
 
 from .product_lookup import ProductLookup
 from .purchase_book import Allocation, PurchaseBook
@@ -29,6 +36,11 @@ class PlanItem:
     huohao: str | None = None
     allocations: list[Allocation] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # 余量不够时不再算成阻塞整批的 errors，而是跳过这一行（allocations 留空、什么都不写），
+    # 原因记在这里——跟 errors 分开是因为这两种情况现在处理方式完全不同：errors 非空会让
+    # Plan.has_blocking_errors 变 True、整批都不写；skip_reason 非空只是这一行自己不写，
+    # 其它行照常处理，见 build_plan 里 _TEMPLATE_PRIORITY 附近的说明。
+    skip_reason: str | None = None
 
 
 @dataclass
@@ -45,10 +57,27 @@ class Plan:
     def total_allocations(self) -> int:
         return sum(len(item.allocations) for item in self.items)
 
+    @property
+    def skipped_items(self) -> list[PlanItem]:
+        return [item for item in self.items if item.skip_reason]
+
 
 def _line_label(line: PlanLine) -> str:
     prefix = f"[{line.source_file}] " if line.source_file else ""
     return f"{prefix}第{line.source_row}行"
+
+
+# 处理顺序：亚马逊 > 沃尔玛 > 海外仓——库存是几个平台共用的同一批采购订单，先到先得（见
+# purchase_book.allocate 的说明），谁先分摊就更容易分到货。业务上海外仓补货没有平台账号
+# 被压评分/限制上架这种硬约束，缺货可以晚几天再发，亚马逊/沃尔玛断货的代价更大，所以特意
+# 把海外仓排在最后——真缺货的话，缺口优先落在海外仓身上，不是随便哪个平台撞上就算倒霉。
+# 没有 template_type（理论上不会发生，parse_shipment_plan 统一写过）的排在最后、跟海外仓
+# 同一优先级，不让它意外插到亚马逊/沃尔玛前面抢库存。
+_TEMPLATE_PRIORITY = {"amazon": 0, "walmart": 1, "overseas": 2}
+
+
+def _template_priority(line: PlanLine) -> int:
+    return _TEMPLATE_PRIORITY.get(line.template_type, len(_TEMPLATE_PRIORITY))
 
 
 def build_plan(
@@ -70,7 +99,10 @@ def build_plan(
         ]
         return Plan(ship_date=ship_date, items=items, parse_errors=parse_errors)
 
-    for line in lines:
+    # 稳定排序：同一模板内部原来的先后顺序不变，只是把不同模板的行分组、按优先级重新排列。
+    ordered_lines = sorted(lines, key=_template_priority)
+
+    for line in ordered_lines:
         item = PlanItem(line=line)
         huohao = lookup.resolve(line.sku_kind, line.sku)
         if huohao is None:
@@ -82,13 +114,20 @@ def build_plan(
 
         item.huohao = huohao
         outcome = purchase_book.allocate(huohao, line.quantity)
-        item.allocations = outcome.allocations
 
         if outcome.shortfall > 0:
-            item.errors.append(
+            # 跳过、不写——不算整批的阻塞错误。回滚这次分摊已经占用的余量，不然这个注定要
+            # 跳过的分摊会白白占掉后面同货号其它行本来还能分到的库存（见 PurchaseRow.remaining
+            # 的算法：outcome.allocations 里的每一份在 purchase_book.allocate 内部已经把
+            # row_obj.consumed_this_run 加过了，这里必须原样减回去）。
+            for allocation in outcome.allocations:
+                allocation.row.consumed_this_run -= allocation.quantity
+            item.skip_reason = (
                 f"{_line_label(line)}：货号「{huohao}」相关采购订单的未出货数量"
-                f"加起来还差 {outcome.shortfall} 个，凑不够这次要发的 {line.quantity} 个"
+                f"加起来还差 {outcome.shortfall} 个，凑不够这次要发的 {line.quantity} 个，已跳过"
             )
+        else:
+            item.allocations = outcome.allocations
 
         items.append(item)
 
@@ -266,3 +305,45 @@ def apply_plan_summary_only(
     summary_book.sync_auto_filter()
 
     return changes
+
+
+_TEMPLATE_LABELS_ZH = {"amazon": "亚马逊", "walmart": "沃尔玛", "overseas": "海外仓"}
+
+
+def write_skipped_items_report(skipped_items: list[PlanItem], first_plan_path: Path) -> Path | None:
+    """把因为余量不够被跳过的发货计划行汇总成一张"异常数据表格"，存在这一批第一份发货计划表
+    旁边（同一个文件夹）——方便运营回头看这一批里到底哪些没发出去、该补哪些货。
+
+    没有任何被跳过的行就不生成文件，不然每次正常跑完都平白多出一个空表，反而让人分不清
+    "这次真的有问题"还是"这个工具每次都会生成一个"。文件名带时间戳，避免同一天跑了好几批、
+    后一次的异常表把前一次的覆盖掉。
+    """
+    if not skipped_items:
+        return None
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "异常数据"
+    ws.append(["来源文件", "表格行数", "平台", "SKU 种类", "SKU", "货号", "目的地/ZD", "需要数量", "说明"])
+    for item in skipped_items:
+        line = item.line
+        ws.append(
+            [
+                line.source_file,
+                line.source_row,
+                _TEMPLATE_LABELS_ZH.get(line.template_type, line.template_type or ""),
+                line.sku_kind,
+                line.sku,
+                item.huohao or "",
+                line.destination_label,
+                line.quantity,
+                item.skip_reason or "",
+            ]
+        )
+    for col in range(1, ws.max_column + 1):
+        ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = 18
+
+    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    out_path = first_plan_path.parent / f"{first_plan_path.stem}-异常数据-{timestamp}.xlsx"
+    wb.save(out_path)
+    return out_path

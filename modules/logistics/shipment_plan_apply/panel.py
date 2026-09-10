@@ -2,8 +2,11 @@
 
 不做预览、不弹二次确认——点一下「写入」就直接跑完整个流程（解析发货计划表→校验分摊→写入
 采购汇总表和发货计划汇总表→存盘），写入前仍然会先自动备份这两份原文件（见 core/backup.py），
-这是唯一保留的安全网。如果这一批发货计划里有任何问题（分摊不够、SKU 查不到货号……），
-在写入之前就会整批拦下来，列在报错框里，不会写进去一半。
+这是唯一保留的安全网。如果这一批发货计划里有数据本身的问题（SKU 查不到货号、解析报错……），
+在写入之前就会整批拦下来，列在报错框里，不会写进去一半；"余量不够"是唯一的例外——只把
+那一行跳过（不写、不算阻塞），其它行照常写入，跳过的行汇总成一张异常数据表格存在第一份
+发货计划表旁边（见 planner.py 的 write_skipped_items_report）。分摊时按亚马逊>沃尔玛>
+海外仓的顺序处理，真缺货的话缺口优先落在海外仓身上（见 planner.py 的 _TEMPLATE_PRIORITY）。
 
 写入可能要处理几千上万行的表格（发货计划汇总表插入一行要重新扫描它后面所有行的公式，见
 shipment_summary.py），跑起来可能要几分钟，所以放在后台线程里跑，不能卡住界面。
@@ -36,7 +39,7 @@ from PySide6.QtWidgets import (
 
 from core.backup import backup_file
 
-from .planner import apply_plan, build_plan
+from .planner import apply_plan, build_plan, write_skipped_items_report
 from .product_lookup import load_product_lookup
 from .purchase_book import PurchaseBook
 from .shipment_summary import ShipmentSummaryBook
@@ -103,7 +106,7 @@ class _WriteWorker(QThread):
     # 的话备份已经生成了，但原文件可能已经写了一半，弹窗措辞不一样。
     backup_failed = Signal(str)
     save_failed = Signal(str, str, str)  # 报错信息, 采购订单汇总表备份文件名, 发货计划汇总表备份文件名
-    succeeded = Signal(str, str)  # 采购订单汇总表备份文件名, 发货计划汇总表备份文件名
+    succeeded = Signal(str, str, int, str)  # 采购备份文件名, 发货计划备份文件名, 跳过条数, 异常表格路径（没有就是空字符串）
     failed = Signal(str)
     stage = Signal(str)  # 只报"现在在做什么"，用在算不出总数/瞬间就完事的步骤（读文件、解析、校验）
     progress = Signal(str, int, int)  # 阶段名, done, total——用在真的耗时、数得出总数的步骤
@@ -198,7 +201,19 @@ class _WriteWorker(QThread):
                 self.save_failed.emit(str(exc), purchase_backup.name, summary_backup.name)
                 return
 
-            self.succeeded.emit(purchase_backup.name, summary_backup.name)
+            # 异常表格是"锦上添花"的附加产物，不是这次写入成不成功的一部分——文件都已经存盘了，
+            # 这一步哪怕出问题也不该把整次操作报成失败，只是异常表格没生成而已，写进 stage
+            # 文案里让人自己注意，不额外弹一个错误框。
+            report_path = ""
+            if plan.skipped_items:
+                first_plan_path = Path(self._plan_files[0][0])
+                try:
+                    written = write_skipped_items_report(plan.skipped_items, first_plan_path)
+                    report_path = str(written) if written is not None else ""
+                except Exception:
+                    report_path = ""
+
+            self.succeeded.emit(purchase_backup.name, summary_backup.name, len(plan.skipped_items), report_path)
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -228,8 +243,9 @@ class ShipmentPlanApplyPanel(QWidget):
         layout.addWidget(title)
         note = QLabel(
             "会真的修改采购订单汇总表和发货计划汇总表——点「写入」直接生效，不会再弹预览确认。"
-            "写入前会自动先备份这两份文件的原始版本；如果这一批发货计划有问题，会在写入前整批"
-            "拦下来，不会写进去一半。"
+            "写入前会自动先备份这两份文件的原始版本；如果这一批发货计划有数据问题，会在写入前"
+            "整批拦下来。分摊按亚马逊>沃尔玛>海外仓的顺序处理，"
+            "哪一行余量不够会被单独跳过（不算整批出错），跳过的行会汇总成一张异常数据表格。"
         )
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -417,9 +433,13 @@ class ShipmentPlanApplyPanel(QWidget):
         self._error_text.setPlainText("\n".join(error_lines))
         self._error_text.show()
 
-    def _on_succeeded(self, purchase_backup_name: str, summary_backup_name: str):
+    def _on_succeeded(self, purchase_backup_name: str, summary_backup_name: str, skipped_count: int, report_path: str):
         self._progress.hide()
-        self._status_label.setText(f"已写入。备份文件：{purchase_backup_name} / {summary_backup_name}")
+        text = f"已写入。备份文件：{purchase_backup_name} / {summary_backup_name}"
+        if skipped_count > 0:
+            text += f"\n有 {skipped_count} 行因为余量不够被跳过，没有写入。"
+            text += f"\n异常数据表格：{report_path}" if report_path else "\n（异常数据表格生成失败，跳过的记录只能自己核对）"
+        self._status_label.setText(text)
         self._write_button.setText("已写入")
         # 特意不重新 setEnabled(True)——写完就写完了，留着"已写入"这个禁用状态的按钮，
         # 防止手滑再点一次把同样的改动重复写进去。

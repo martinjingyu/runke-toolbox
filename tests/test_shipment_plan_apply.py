@@ -948,7 +948,10 @@ def test_diff_preview_group_tracks_leftover_row_consumed_by_a_later_change(tmp_p
     assert all(row[GROUP_KEY] == result.summary.before_rows[0][GROUP_KEY] for row in result.summary.after_rows)
 
 
-def test_planner_blocks_whole_batch_on_shortfall(tmp_path):
+def test_planner_skips_shortfall_item_without_blocking_batch(tmp_path):
+    # 余量不够不再阻塞整批——只把这一行跳过（记进 skip_reason，不写任何东西），同一批里其它
+    # 行照常处理。跳过的时候要把这次分摊已经占用的余量退回去，不然会白白占掉后面同货号其它
+    # 行本来还能分到的库存（这里第二条行请求的 50 个，如果没退回去会跟着一起分不到）。
     product_path = tmp_path / "product.xlsx"
     _write_product_info(product_path, [("AMZ-1", "RK-1", "M1")])
     lookup = load_product_lookup(product_path)
@@ -961,12 +964,101 @@ def test_planner_blocks_whole_batch_on_shortfall(tmp_path):
     from modules.logistics.shipment_plan_apply.shipment_templates import PlanLine
 
     lines = [
-        PlanLine(zd="ZD1", sku_kind="RK", sku="RK-1", quantity=9999, destination_label="ZD1", source_row=2)
+        PlanLine(zd="ZD1", sku_kind="RK", sku="RK-1", quantity=9999, destination_label="ZD1", source_row=2),
+        PlanLine(zd="ZD1", sku_kind="RK", sku="RK-1", quantity=50, destination_label="ZD1", source_row=3),
     ]
     plan = build_plan(lines, [], lookup, purchase_book, dt.date(2026, 9, 1))
-    assert plan.has_blocking_errors
-    with pytest.raises(ValueError):
-        apply_plan(plan, purchase_book, None)
+    assert not plan.has_blocking_errors
+
+    assert len(plan.skipped_items) == 1
+    skipped = plan.skipped_items[0]
+    assert skipped.line.quantity == 9999
+    assert skipped.allocations == []
+    assert "还差" in skipped.skip_reason
+
+    processed = next(item for item in plan.items if item.line.quantity == 50)
+    assert processed.skip_reason is None
+    assert sum(a.quantity for a in processed.allocations) == 50  # 余量被正确退回，第二条行分到满额
+
+    apply_plan_purchase_only(plan, purchase_book)  # 不再抛错
+    date_col = purchase_book.require_date_column(dt.date(2026, 9, 1))
+    early_row = next(r for r in purchase_book.rows if r.order_no == "PO-EARLY")
+    assert purchase_wb.active.cell(row=early_row.row_index, column=date_col).value == 50
+
+
+def test_planner_prioritizes_amazon_then_walmart_then_overseas_on_shortfall(tmp_path):
+    # 库存不够分给所有平台的时候，缺口应该落在海外仓身上——不管这几行在输入列表里的先后
+    # 顺序，build_plan 都要按亚马逊>沃尔玛>海外仓重新排过再分摊。
+    product_path = tmp_path / "product.xlsx"
+    _write_product_info(product_path, [("AMZ-1", "RK-1", "M1")])
+    lookup = load_product_lookup(product_path)
+
+    purchase_path = tmp_path / "purchase.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append([
+        "订单号", "采购日期", "型号", "订单数量", "数量单位",
+        dt.datetime(2026, 9, 1), "未出货数量",
+    ])
+    ws.append([None, None, None, None, None, "出货时间", None])
+    ws.append(["PO-1", dt.datetime(2026, 1, 1), "M1", 30, "pcs", None, "=D3-SUM(F3:F3)"])
+    wb.save(purchase_path)
+    purchase_wb = openpyxl.load_workbook(purchase_path, data_only=False)
+    purchase_book = PurchaseBook(purchase_wb.active)
+
+    from modules.logistics.shipment_plan_apply.shipment_templates import PlanLine
+
+    # 故意把输入顺序反着排（海外仓在前、亚马逊在后），确认真正生效的是模板优先级，不是
+    # 输入列表原来的先后顺序。
+    lines = [
+        PlanLine(
+            zd="LO-RK", sku_kind="RK", sku="RK-1", quantity=30, destination_label="LO-RK",
+            source_row=2, template_type="overseas",
+        ),
+        PlanLine(
+            zd="US", sku_kind="AMZ", sku="AMZ-1", quantity=30, destination_label="US",
+            source_row=2, template_type="amazon",
+        ),
+    ]
+    plan = build_plan(lines, [], lookup, purchase_book, dt.date(2026, 9, 1))
+    assert not plan.has_blocking_errors
+
+    amazon_item = next(i for i in plan.items if i.line.template_type == "amazon")
+    overseas_item = next(i for i in plan.items if i.line.template_type == "overseas")
+    assert amazon_item.skip_reason is None
+    assert sum(a.quantity for a in amazon_item.allocations) == 30
+    assert overseas_item.skip_reason is not None
+    assert overseas_item.allocations == []
+
+
+def test_write_skipped_items_report_creates_file_next_to_first_plan(tmp_path):
+    from modules.logistics.shipment_plan_apply.planner import PlanItem, write_skipped_items_report
+    from modules.logistics.shipment_plan_apply.shipment_templates import PlanLine
+
+    plan_dir = tmp_path / "plans"
+    plan_dir.mkdir()
+    first_plan_path = plan_dir / "亚马逊计划.xlsx"
+
+    # 没有任何跳过的行就不该生成文件
+    assert write_skipped_items_report([], first_plan_path) is None
+
+    skipped_line = PlanLine(
+        zd="LO-RK", sku_kind="RK", sku="RK-9", quantity=99, destination_label="LO-RK",
+        source_row=5, source_file="海外仓计划.xlsx", template_type="overseas",
+    )
+    skipped_item = PlanItem(line=skipped_line, huohao="TD-9", skip_reason="货号「TD-9」还差 10 个，已跳过")
+
+    out_path = write_skipped_items_report([skipped_item], first_plan_path)
+    assert out_path is not None
+    assert out_path.parent == plan_dir
+    assert out_path.name.startswith("亚马逊计划-异常数据-")
+
+    wb = openpyxl.load_workbook(out_path)
+    ws = wb.active
+    header = [c.value for c in ws[1]]
+    assert header == ["来源文件", "表格行数", "平台", "SKU 种类", "SKU", "货号", "目的地/ZD", "需要数量", "说明"]
+    row = [c.value for c in ws[2]]
+    assert row == ["海外仓计划.xlsx", 5, "海外仓", "RK", "RK-9", "TD-9", "LO-RK", 99, "货号「TD-9」还差 10 个，已跳过"]
 
 
 def test_build_plan_reports_missing_date_column_instead_of_inserting(tmp_path):
