@@ -360,60 +360,101 @@ def test_ylyn_get_last_routes_matches_by_bill_code(monkeypatch):
 # ---- platforms/zhongbao.py ----
 
 
-class _FakeZhongbaoSession:
-    """假 requests.Session，按 trackingRef 查询参数返回预设的响应体，不联网。"""
+class _FakeCookies:
+    """假 requests.Session.cookies，只用来让 _xsrf_header() 读到一个固定的 XSRF-TOKEN。"""
 
-    def __init__(self, responses: dict[str, dict]):
-        self._responses = responses
-
-    def get(self, url, params, headers, timeout):
-        assert headers == {"appKey": "AK", "appToken": "AT"}
-        waybill = params["trackingRef"]
-        return _FakeZhongbaoResponse(self._responses[waybill])
+    def get(self, name):
+        return "fake-xsrf-token" if name == "XSRF-TOKEN" else None
 
 
 class _FakeZhongbaoResponse:
-    def __init__(self, data: dict):
-        self._data = data
+    def __init__(self, status_code=200, json_data=None):
+        self.status_code = status_code
+        self._json_data = json_data
 
     def raise_for_status(self):
         pass
 
     def json(self):
-        return self._data
+        return self._json_data
 
 
-def test_zhongbao_get_last_routes_picks_latest_event_and_reports_failures():
-    """众包一次只能查一个运单号（没有批量接口），get_last_routes() 因此是循环调用；这里验证
-    三种情况：dataList 乱序时按时间取最新一条、4xx 失败码原样透传 description、查到了但没有
-    轨迹事件时报"暂无路由信息"。
+class _FakeZhongbaoSession:
+    """假 requests.Session：get/post 只用来走登录流程（不校验密码，反正是 RSA 加密过的密文，
+    单测不关心加密细节），put 按 isShipper 返回预设的运单列表——用来验证"客户身份"/"发货人身份"
+    两个 tab 按 jobNum 去重合并这件事。
+    """
+
+    def __init__(self, bookings_by_shipper: dict[bool, list[dict]], login_status: int = 200):
+        self.cookies = _FakeCookies()
+        self._bookings_by_shipper = bookings_by_shipper
+        self._login_status = login_status
+
+    def get(self, url, timeout):
+        return _FakeZhongbaoResponse()
+
+    def post(self, url, data, headers, timeout):
+        assert headers["X-XSRF-TOKEN"] == "fake-xsrf-token"
+        return _FakeZhongbaoResponse(status_code=self._login_status)
+
+    def put(self, url, params, json, headers, timeout):
+        assert headers["X-XSRF-TOKEN"] == "fake-xsrf-token"
+        return _FakeZhongbaoResponse(json_data=self._bookings_by_shipper[json["isShipper"]])
+
+
+def test_zhongbao_login_failure_raises():
+    from modules.logistics.logistics_tracking.platforms.zhongbao import ZhongbaoClient
+
+    session = _FakeZhongbaoSession(bookings_by_shipper={False: [], True: []}, login_status=401)
+    with pytest.raises(RuntimeError):
+        ZhongbaoClient("rkyx", "wrong-password", session=session)
+
+
+def test_zhongbao_get_last_routes_merges_both_tabs_and_reports_failures():
+    """"客户身份"(isShipper=False)和"发货人身份"(isShipper=True)两个 tab 实测不完全是同一批
+    运单，这里验证：两边都拉一遍、按 jobNum 去重合并；lastestTkStatus 为空时退回用 status 兜底；
+    真的没查到的运单号报"未找到该运单"。
     """
     from modules.logistics.logistics_tracking.platforms.zhongbao import ZhongbaoClient
 
-    responses = {
-        "ZB0001": {
-            "code": "200",
-            "dataList": [
-                {"time": "2026-07-01 10:00", "context": "已揽收"},
-                {"time": "2026-07-03 08:00", "context": "已到港"},  # 乱序放在中间，得挑到这条
-                {"time": "2026-07-02 09:00", "context": "运输中"},
-            ],
-        },
-        "ZB0002": {"code": "403", "description": "Not authorized!"},
-        "ZB0003": {"code": "200", "dataList": []},
+    bookings_by_shipper = {
+        False: [
+            {
+                "jobNum": "ZBSZ0001",
+                "lastestTkStatus": "已预约派送，预约时间USA：2026-09-15。",
+                "lastModifiedTime": "2026-09-11T11:35:53+08:00",
+            },
+            {"jobNum": "ZBSZ0002", "lastestTkStatus": None, "status": "deliveryAppointed"},
+        ],
+        True: [
+            # ZBSZ0001 在两个 tab 里都有，合并后不应该重复；ZBSZ0003 只在这个 tab 里出现。
+            {
+                "jobNum": "ZBSZ0001",
+                "lastestTkStatus": "已预约派送，预约时间USA：2026-09-15。",
+                "lastModifiedTime": "2026-09-11T11:35:53+08:00",
+            },
+            {
+                "jobNum": "ZBSZ0003",
+                "lastestTkStatus": "待拼车中",
+                "lastModifiedTime": "2026-09-11T05:30:51+08:00",
+            },
+        ],
     }
-    client = ZhongbaoClient(app_key="AK", app_token="AT", session=_FakeZhongbaoSession(responses))
+    client = ZhongbaoClient("rkyx", "Rkyx0106", session=_FakeZhongbaoSession(bookings_by_shipper))
 
-    result = client.get_last_routes(["ZB0001", "ZB0002", "ZB0003"])
+    result = client.get_last_routes(["ZBSZ0001", "ZBSZ0002", "ZBSZ0003", "NOT_EXIST"])
 
-    assert result["ZB0001"].found is True
-    assert result["ZB0001"].last_route == "2026-07-03 08:00 已到港"
+    assert result["ZBSZ0001"].found is True
+    assert result["ZBSZ0001"].last_route == "2026-09-11T11:35:53+08:00 已预约派送，预约时间USA：2026-09-15。"
 
-    assert result["ZB0002"].found is False
-    assert result["ZB0002"].error == "Not authorized!"
+    assert result["ZBSZ0002"].found is True
+    assert result["ZBSZ0002"].last_route == "deliveryAppointed"
 
-    assert result["ZB0003"].found is False
-    assert result["ZB0003"].error == "暂无路由信息"
+    assert result["ZBSZ0003"].found is True
+    assert result["ZBSZ0003"].last_route == "2026-09-11T05:30:51+08:00 待拼车中"
+
+    assert result["NOT_EXIST"].found is False
+    assert result["NOT_EXIST"].error == "未找到该运单"
 
 
 # ---- platforms/kqgyl.py ----

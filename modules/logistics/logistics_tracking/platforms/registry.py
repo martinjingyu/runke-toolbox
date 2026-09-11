@@ -151,10 +151,10 @@ def get_last_routes_for_carrier(
         if not accounts:
             return _no_accounts(label, waybill_numbers)
 
-        # 众包这家"账号管理"里存的其实是 appKey/appToken(一对应用级密钥，不是网页登录密码)，
-        # 借用同一套账号密码 UI 的两个输入框存，见 zhongbao.py 顶部说明。
-        def factory(app_key: str, app_token: str) -> ZhongbaoClient:
-            return ZhongbaoClient(app_key=app_key, app_token=app_token)
+        # 众包这家"账号管理"里存的就是网页登录账号密码本身，见 zhongbao.py 顶部说明
+        # (之前一度以为是 appKey/appToken，走不通，已经改回网页登录这条路)。
+        def factory(username: str, password: str) -> ZhongbaoClient:
+            return ZhongbaoClient(username=username, password=password)
 
         return _lookup_multi_account(factory, accounts, waybill_numbers)
 
