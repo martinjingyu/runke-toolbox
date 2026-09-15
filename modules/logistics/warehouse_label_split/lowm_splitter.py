@@ -8,8 +8,9 @@
 
 流程：
     1. 站点代号从文件名推导（复用 splitter.py 的 derive_warehouse_code）。
-    2. 发货计划表里，找「仓库含站点代号 + 状态=未发货」的行，按「工厂」汇总「箱数」
-       （见 shipping_plan.py 的 load_pending_boxes_by_factory）。
+    2. 发货计划表里，找「仓库含站点代号 + ZD=LO-WM + 状态=未发货」的行，按「工厂」汇总「箱数」
+       （见 shipping_plan.py 的 load_pending_boxes_by_factory）——同一个仓库代号底下可能还挂着
+       CK-WM 这类别的店铺的待发货记录，不认 ZD 的话箱数会把别的店铺也算进来。
     3. 按工厂代号排序（没有顺序要求，选一个固定、可预测的顺序，跟其它拆分工具的排序习惯
        一致），依次把这么多页从 PDF 里切下来给这个工厂，页码紧跟着上一个工厂切完的位置继续
        切，不重叠、不跳页。
@@ -36,6 +37,8 @@ import fitz
 from .shipping_plan import load_pending_boxes_by_factory
 from .splitter import derive_warehouse_code
 
+ZD = "LO-WM"
+
 
 @dataclass
 class FactoryAllocation:
@@ -56,12 +59,13 @@ def run(label_pdf_path: str | Path, shipping_plan_path: str | Path, ship_date: d
 
     doc = fitz.open(label_pdf_path)
     try:
-        totals = load_pending_boxes_by_factory(shipping_plan_path, warehouse_code, ship_date)
+        totals = load_pending_boxes_by_factory(shipping_plan_path, warehouse_code, ship_date, zd=ZD)
 
         report = LowmSplitReport()
         if not totals:
             report.notes.append(
-                f"发货计划表里查不到仓库含 {warehouse_code} + 未发货 + 发货时间={ship_date.isoformat()} 的记录，未拆分"
+                f"发货计划表里查不到仓库含 {warehouse_code} + ZD={ZD} + 未发货 + "
+                f"发货时间={ship_date.isoformat()} 的记录，未拆分"
             )
             return report
 

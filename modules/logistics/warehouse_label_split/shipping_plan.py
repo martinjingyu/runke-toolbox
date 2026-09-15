@@ -37,7 +37,7 @@ import openpyxl
 from ..shipment_plan_apply.column_utils import column_index_map, find_header_row, require_columns
 
 REQUIRED_HEADERS = ["标签", "状态", "箱数", "工厂", "仓库", "发货时间"]
-REQUIRED_HEADERS_BY_FACTORY = ["状态", "箱数", "工厂", "仓库", "发货时间"]
+REQUIRED_HEADERS_BY_FACTORY = ["状态", "箱数", "工厂", "仓库", "发货时间", "ZD"]
 
 PENDING_STATUS = "未发货"
 
@@ -134,13 +134,24 @@ def load_pending_groups(
 
 
 def load_pending_boxes_by_factory(
-    xlsx_path: str | Path, warehouse_code: str, ship_date: dt.date, sheet_name: str | None = None
+    xlsx_path: str | Path,
+    warehouse_code: str,
+    ship_date: dt.date,
+    zd: str,
+    sheet_name: str | None = None,
 ) -> dict[str, float]:
     """跟 load_pending_groups 一样按「仓库含 warehouse_code + 状态=未发货 + 发货时间=
     ship_date」筛选，但不看「标签」，直接按「工厂」把「箱数」加总——给 lowm_splitter.py 用：
     LO-WM 站点的箱唛 PDF 不需要认每一页具体是哪个 SKU（Walmart 只在乎这一批货的总箱数，不在乎
     每箱具体装的是什么，见 lowm_splitter.py 顶部说明），只要知道"这个厂商这次一共要发多少箱"
     就够了。
+
+    多加一层「ZD 等于 zd」的过滤——「仓库」只是 Walmart 收货的物理仓库代号（比如 DFW5），同一个
+    仓库代号底下 CK-WM、LO-WM 这些不同店铺（不同 ZD）的待发货记录可能同时存在，光按仓库代号
+    过滤会把别的店铺的箱数也算进这一批 LO-WM 箱唛里；「ZD」这一列精确等于哪个店铺代号
+    （比如"LO-WM"），才是真正区分这批货属于哪个店铺的字段，见 shipment_templates.py 里
+    _WALMART_SHOP_ZD_RULES 的说明。ZD 按精确相等比较，不做包含匹配（"LO-WM"和"CK-WM"互相都
+    不是对方的子串，但精确相等更符合这一列本身的语义，也跟"标签"这类列的比较方式一致）。
     """
     wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
     ws = wb[sheet_name] if sheet_name else wb[wb.sheetnames[0]]
@@ -160,6 +171,10 @@ def load_pending_boxes_by_factory(
 
         warehouse = row[idx["仓库"] - 1].value
         if warehouse is None or warehouse_code not in str(warehouse):
+            continue
+
+        row_zd = row[idx["ZD"] - 1].value
+        if row_zd is None or str(row_zd).strip() != zd:
             continue
 
         factory = row[idx["工厂"] - 1].value
