@@ -31,22 +31,25 @@ from .panel import _date_picker_row, _file_picker_row
 
 
 class _LowmSplitWorker(QThread):
-    succeeded = Signal(object)  # LowmSplitReport
+    succeeded = Signal(object)  # list[tuple[str, LowmSplitReport]]，每个箱唛 PDF 一份
     failed = Signal(str)
 
-    def __init__(self, label_pdf_path: str, shipping_plan_path: str, ship_date: dt.date):
+    def __init__(self, label_pdf_paths: list[str], shipping_plan_path: str, ship_date: dt.date):
         super().__init__()
-        self._label_pdf_path = label_pdf_path
+        self._label_pdf_paths = label_pdf_paths
         self._shipping_plan_path = shipping_plan_path
         self._ship_date = ship_date
 
     def run(self):
-        try:
-            report = run_lowm_split(self._label_pdf_path, self._shipping_plan_path, self._ship_date)
-        except Exception as exc:
-            self.failed.emit(str(exc))
-            return
-        self.succeeded.emit(report)
+        reports: list[tuple[str, LowmSplitReport]] = []
+        for label_pdf_path in self._label_pdf_paths:
+            try:
+                report = run_lowm_split(label_pdf_path, self._shipping_plan_path, self._ship_date)
+            except Exception as exc:
+                self.failed.emit(f"{Path(label_pdf_path).name}：{exc}")
+                return
+            reports.append((label_pdf_path, report))
+        self.succeeded.emit(reports)
 
 
 class LowmSplitPanel(QWidget):
@@ -54,6 +57,7 @@ class LowmSplitPanel(QWidget):
         super().__init__()
         self._worker: _LowmSplitWorker | None = None
         self._output_dir: Path | None = None
+        self._label_pdf_paths: list[str] = []
 
         layout = QVBoxLayout(self)
 
@@ -64,7 +68,10 @@ class LowmSplitPanel(QWidget):
         inputs_box = QGroupBox("输入")
         inputs_layout = QVBoxLayout(inputs_box)
 
-        row, self._label_pdf_edit = _file_picker_row("站点箱唛 PDF（比如 DFW5s.pdf）", "PDF 文件 (*.pdf)", self._browse_label_pdf)
+        row, self._label_pdf_edit = _file_picker_row(
+            "站点箱唛 PDF（可多选，一个站点一个文件，比如 DFW5s.pdf）", "PDF 文件 (*.pdf)", self._browse_label_pdf
+        )
+        self._label_pdf_edit.setReadOnly(True)
         inputs_layout.addLayout(row)
 
         row, self._plan_edit = _file_picker_row("发货计划表", "Excel 文件 (*.xlsx *.xlsm)", self._browse_plan)
@@ -75,9 +82,10 @@ class LowmSplitPanel(QWidget):
         inputs_layout.addLayout(row)
 
         hint = QLabel(
-            "站点代号取自箱唛 PDF 的文件名（第一个「-」之前的部分）。"
+            "可以一次选多个站点的箱唛 PDF，会按选中的顺序逐个处理，互不影响。"
+            "站点代号取自箱唛 PDF 的文件名（开头连续的英文字母/数字，遇到「-」、空格等其它字符就截断）。"
             "不需要认 SKU：按发货计划表里「仓库含这个站点代号、状态=未发货、发货时间=上面选的日期」的记录按厂商汇总箱数，"
-            "直接按顺序切页给各厂商，在箱唛 PDF 所在目录下按「厂商代号/站点代号」新建两层文件夹（比如「GH/DFW5s」），"
+            "直接按顺序切页给各厂商，在对应箱唛 PDF 所在目录下按「厂商代号/站点代号」新建两层文件夹（比如「GH/DFW5s」），"
             "文件按「厂商代号 站点代号 箱数箱.pdf」命名。"
         )
         hint.setWordWrap(True)
@@ -107,9 +115,11 @@ class LowmSplitPanel(QWidget):
         layout.addWidget(self._log, 1)
 
     def _browse_label_pdf(self, line_edit: QLineEdit):
-        path, _ = QFileDialog.getOpenFileName(self, "选择站点箱唛 PDF", "", "PDF 文件 (*.pdf)")
-        if path:
-            line_edit.setText(path)
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择站点箱唛 PDF（可多选，一个站点一个文件）", "", "PDF 文件 (*.pdf)")
+        if paths:
+            self._label_pdf_paths = paths
+            names = "、".join(Path(p).name for p in paths)
+            line_edit.setText(f"已选 {len(paths)} 个文件：{names}")
 
     def _browse_plan(self, line_edit: QLineEdit):
         path, _ = QFileDialog.getOpenFileName(self, "选择发货计划表", "", "Excel 文件 (*.xlsx *.xlsm)")
@@ -117,11 +127,10 @@ class LowmSplitPanel(QWidget):
             line_edit.setText(path)
 
     def _start_run(self):
-        label_pdf_path = self._label_pdf_edit.text().strip()
         plan_path = self._plan_edit.text().strip()
 
         missing = []
-        if not label_pdf_path:
+        if not self._label_pdf_paths:
             missing.append("站点箱唛 PDF")
         if not plan_path:
             missing.append("发货计划表")
@@ -135,27 +144,33 @@ class LowmSplitPanel(QWidget):
         self._log.clear()
 
         ship_date = self._ship_date_edit.date().toPython()
-        self._output_dir = Path(label_pdf_path).parent
-        self._worker = _LowmSplitWorker(label_pdf_path, plan_path, ship_date)
+        self._output_dir = Path(self._label_pdf_paths[0]).parent
+        self._worker = _LowmSplitWorker(self._label_pdf_paths, plan_path, ship_date)
         self._worker.succeeded.connect(self._on_success)
         self._worker.failed.connect(self._on_failure)
         self._worker.start()
 
-    def _on_success(self, report: LowmSplitReport):
+    def _on_success(self, reports: list[tuple[str, LowmSplitReport]]):
         self._run_button.setEnabled(True)
-        self._open_output_button.setEnabled(bool(report.outputs))
+        total_outputs = sum(len(report.outputs) for _, report in reports)
+        total_notes = sum(len(report.notes) for _, report in reports)
+        self._open_output_button.setEnabled(total_outputs > 0)
 
-        self._status_label.setText(f"完成。拆出了 {len(report.outputs)} 个厂商的文件，{len(report.notes)} 条需要人工看一下的提示。")
+        self._status_label.setText(
+            f"完成。{len(reports)} 个箱唛 PDF，共拆出了 {total_outputs} 个厂商的文件，{total_notes} 条需要人工看一下的提示。"
+        )
 
-        lines = [
-            f"{o.output_path.parent.parent.name}/{o.output_path.parent.name}/{o.output_path.name}"
-            for o in sorted(report.outputs, key=lambda o: o.factory)
-        ]
-        if report.notes:
-            lines.append("")
+        lines: list[str] = []
+        for label_pdf_path, report in reports:
+            lines.append(f"【{Path(label_pdf_path).name}】")
+            lines.extend(
+                f"{o.output_path.parent.parent.name}/{o.output_path.parent.name}/{o.output_path.name}"
+                for o in sorted(report.outputs, key=lambda o: o.factory)
+            )
             lines.extend(report.notes)
+            lines.append("")
         if lines:
-            self._log.setPlainText("\n".join(lines))
+            self._log.setPlainText("\n".join(lines).rstrip())
 
     def _on_failure(self, message: str):
         self._run_button.setEnabled(True)
