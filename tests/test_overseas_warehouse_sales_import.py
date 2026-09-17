@@ -1,3 +1,4 @@
+from datetime import date
 from pathlib import Path
 
 import openpyxl
@@ -349,15 +350,21 @@ def _write_csv(tmp_path, name, header, rows) -> Path:
     return path
 
 
+_CSV_HEADER = ["Item Number", "SKU", "Quantity", "PO Date", "Order Status"]
+
+
 def test_read_castlegate_csv_sums_multi_row_quantity(tmp_path):
     path = _write_csv(
         tmp_path,
         "CG-RQ export.csv",
-        ["Item Number", "SKU", "Quantity"],
-        [["TD-1", "internal-1", "1"], ["TD-1", "internal-2", "2"]],
+        _CSV_HEADER,
+        [
+            ["TD-1", "internal-1", "1", "09/13/2026", "Shipped"],
+            ["TD-1", "internal-2", "2", "09/13/2026", "Allocated"],
+        ],
     )
 
-    result = read_castlegate_csv(path, platform="WF-RQ")
+    result = read_castlegate_csv(path, platform="WF-RQ", order_date=date(2026, 9, 13))
 
     assert [r.sku for r in result.records] == ["TD-1", "TD-1"]
     assert result.skipped == []
@@ -368,7 +375,7 @@ def test_read_castlegate_csv_missing_required_column(tmp_path):
     path = _write_csv(tmp_path, "bad.csv", ["Item Number"], [["TD-1"]])
 
     with pytest.raises(SourceReadError, match="缺少必须的表头列"):
-        read_castlegate_csv(path, platform="WF-RQ")
+        read_castlegate_csv(path, platform="WF-RQ", order_date=date(2026, 9, 13))
 
 
 def test_read_castlegate_csv_skips_row_with_blank_item_number_instead_of_failing_whole_file(tmp_path):
@@ -377,15 +384,74 @@ def test_read_castlegate_csv_skips_row_with_blank_item_number_instead_of_failing
     path = _write_csv(
         tmp_path,
         "CG-RX export.csv",
-        ["Item Number", "SKU", "Quantity"],
-        [["", "", "1"], ["TD-2", "internal-2", "2"]],
+        _CSV_HEADER,
+        [
+            ["", "", "1", "09/13/2026", "Shipped"],
+            ["TD-2", "internal-2", "2", "09/13/2026", "Shipped"],
+        ],
     )
 
-    result = read_castlegate_csv(path, platform="WF-RX")
+    result = read_castlegate_csv(path, platform="WF-RX", order_date=date(2026, 9, 13))
 
     assert [r.sku for r in result.records] == ["TD-2"]
     assert len(result.skipped) == 1
     assert "第2行" in result.skipped[0]
+
+
+def test_read_castlegate_csv_filters_rows_to_only_the_requested_po_date(tmp_path):
+    # 业务确认过的坑：CastleGate 导出的一份 CSV 实际上是一段日期范围的订单（说明文档里写的
+    # "导出9.7-9.13的订单"），不是只有当天，必须按「PO Date」精确过滤到业务人员选的那一天。
+    path = _write_csv(
+        tmp_path,
+        "CG-RX export.csv",
+        _CSV_HEADER,
+        [
+            ["TD-1", "internal-1", "1", "09/12/2026", "Shipped"],  # 不是要导入的那天，跳过
+            ["TD-2", "internal-2", "2", "09/13/2026", "Shipped"],  # 是要导入的那天，保留
+            ["TD-3", "internal-3", "3", "09/14/2026", "Shipped"],  # 不是要导入的那天，跳过
+        ],
+    )
+
+    result = read_castlegate_csv(path, platform="WF-RX", order_date=date(2026, 9, 13))
+
+    assert [r.sku for r in result.records] == ["TD-2"]
+    assert len(result.skipped) == 1
+    assert "2 行" in result.skipped[0] and "PO Date" in result.skipped[0]
+
+
+def test_read_castlegate_csv_excludes_rejected_and_cancelled_orders(tmp_path):
+    path = _write_csv(
+        tmp_path,
+        "CG-RX export.csv",
+        _CSV_HEADER,
+        [
+            ["TD-1", "internal-1", "1", "09/13/2026", "Rejected"],
+            ["TD-2", "internal-2", "2", "09/13/2026", "Cancelled"],
+            ["TD-3", "internal-3", "3", "09/13/2026", "Shipped"],
+            ["TD-4", "internal-4", "4", "09/13/2026", "Allocated"],
+        ],
+    )
+
+    result = read_castlegate_csv(path, platform="WF-RX", order_date=date(2026, 9, 13))
+
+    assert sorted(r.sku for r in result.records) == ["TD-3", "TD-4"]
+    assert len(result.skipped) == 1
+    assert "2 行" in result.skipped[0] and "Rejected/Cancelled" in result.skipped[0]
+
+
+def test_read_castlegate_csv_rejects_unparseable_po_date(tmp_path):
+    path = _write_csv(
+        tmp_path,
+        "CG-RX export.csv",
+        _CSV_HEADER,
+        [["TD-1", "internal-1", "1", "2026年9月13日", "Shipped"]],
+    )
+
+    result = read_castlegate_csv(path, platform="WF-RX", order_date=date(2026, 9, 13))
+
+    assert result.records == []
+    assert len(result.skipped) == 1
+    assert "认不出日期格式" in result.skipped[0]
 
 
 # ---------------------------------------------------------------------------
@@ -741,7 +807,7 @@ def test_real_sales_import_end_to_end(tmp_path):
         ("CG-TS CastleGate_SC_Export_09-14-2026_04-31-56.csv", "WF-TS"),
     ]
     for name, platform in csv_files:
-        result = read_castlegate_csv(REAL_DATA_DIR / name, platform)
+        result = read_castlegate_csv(REAL_DATA_DIR / name, platform, order_date=date(2026, 9, 13))
         records.extend(result.records)
 
     plan = build_plan(target, day=13, records=records)

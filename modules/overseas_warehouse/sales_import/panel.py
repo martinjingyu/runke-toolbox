@@ -11,6 +11,7 @@ xlsx_writer.py 开头的说明），走的是 planner.apply_plan -> xlsx_writer.
 """
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 from PySide6.QtCore import QDate, QSettings, Qt, QThread, Signal
@@ -113,10 +114,11 @@ class _PreviewWorker(QThread):
     failed = Signal(str)
     stage = Signal(str)
 
-    def __init__(self, target_path: str, day: int, erp_path: str, csv_files: list[tuple[str, str]]):
+    def __init__(self, target_path: str, day: int, order_date: date, erp_path: str, csv_files: list[tuple[str, str]]):
         super().__init__()
         self._target_path = target_path
         self._day = day
+        self._order_date = order_date
         self._erp_path = erp_path
         self._csv_files = csv_files
 
@@ -132,7 +134,7 @@ class _PreviewWorker(QThread):
 
             for path, platform in self._csv_files:
                 self.stage.emit(f"正在读取「{Path(path).name}」…")
-                result = read_castlegate_csv(path, platform)
+                result = read_castlegate_csv(path, platform, self._order_date)
                 records.extend(result.records)
                 source_skipped.extend(result.skipped)
 
@@ -208,9 +210,16 @@ class SalesImportPanel(QWidget):
         inputs_layout.addLayout(row)
 
         day_row = QHBoxLayout()
-        day_row.addWidget(QLabel("导入哪一天（几号）"))
+        day_row.addWidget(QLabel(
+            "导入哪一天（写进汇总表哪一列「几号」，也用来在 CG 的 CSV 里按「PO Date」筛选"
+            "——年份/月份要选对，不是只看日）"
+        ))
         self._date_edit = QDateEdit()
-        self._date_edit.setDisplayFormat("d号")
+        # 之前这里只显示"几号"（比如"13号"），年份/月份藏在控件里看不见也改不了——但
+        # CastleGate CSV 要按完整的「PO Date」（年月日）筛选是不是这一天的订单，年月份
+        # 选错了会悄悄筛出一批不对的数据，所以必须让年月日都看得见、能调，不能只露一个"几号"。
+        self._date_edit.setDisplayFormat("yyyy-MM-dd")
+        self._date_edit.setCalendarPopup(True)
         self._date_edit.setDate(QDate.currentDate())
         day_row.addWidget(self._date_edit)
         day_row.addStretch(1)
@@ -326,7 +335,9 @@ class SalesImportPanel(QWidget):
             QMessageBox.warning(self, "缺少输入", "ERP 导出和 CSV 至少要选一个")
             return
 
-        day = self._date_edit.date().day()
+        qdate = self._date_edit.date()
+        day = qdate.day()
+        order_date = date(qdate.year(), qdate.month(), qdate.day())
         csv_files = [(e.path, e.platform) for e in self._csv_entries]
 
         self._preview_button.setEnabled(False)
@@ -338,7 +349,7 @@ class SalesImportPanel(QWidget):
         self._diff_group.clear()
         self._status_label.setText("正在读取源数据、生成预览……")
 
-        self._preview_worker = _PreviewWorker(target_path, day, erp_path, csv_files)
+        self._preview_worker = _PreviewWorker(target_path, day, order_date, erp_path, csv_files)
         self._preview_worker.succeeded.connect(self._on_preview_succeeded)
         self._preview_worker.failed.connect(self._on_preview_failed)
         self._preview_worker.stage.connect(self._on_stage)

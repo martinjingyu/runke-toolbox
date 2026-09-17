@@ -20,6 +20,7 @@ ERP 导出文件后缀是 .xls，但实际内容是 xlsx（zip）格式——不
 from __future__ import annotations
 
 import csv
+import datetime as dt
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,7 +37,14 @@ from .platform_rules import (
 )
 
 ERP_REQUIRED_COLUMNS = ("采购SKU", "店铺", "发货仓库", "采购SKU个数")
-CSV_REQUIRED_COLUMNS = ("Item Number", "Quantity")
+CSV_REQUIRED_COLUMNS = ("Item Number", "Quantity", "PO Date", "Order Status")
+
+# CastleGate 导出的一份 CSV 实际上是"一段日期范围"的订单（比如说明文档里写的"导出9.7-9.13
+# 的订单"），不是只有当天——所以必须按「PO Date」精确过滤到业务人员选的那一天，不能整份
+# 文件都当成那一天的数据（这个是之前理解错的地方）。
+_PO_DATE_FORMAT = "%m/%d/%Y"
+# 「Order Status」是 Rejected/Cancelled 的订单不算真实销量，要排除掉。
+_EXCLUDED_ORDER_STATUSES = {"Rejected", "Cancelled"}
 
 
 class SourceReadError(Exception):
@@ -137,8 +145,14 @@ def _read_erp_rows(wb, path: Path) -> ReadResult:
     return ReadResult(records=records, skipped=skipped)
 
 
-def read_castlegate_csv(path: str | Path, platform: str) -> ReadResult:
-    """CG 的 CSV 导出，仓库固定是 CG，平台由调用方传进来（界面上人工选/确认过的）。"""
+def read_castlegate_csv(path: str | Path, platform: str, order_date: dt.date) -> ReadResult:
+    """CG 的 CSV 导出，仓库固定是 CG，平台由调用方传进来（界面上人工选/确认过的）。
+
+    order_date：业务人员这次要导入的那一天——CSV 里「PO Date」跟这个日期不一致的行，
+    直接跳过不算（这份文件本身是一段日期范围的订单，不是只有这一天）。「Order Status」
+    是 Rejected/Cancelled 的也跳过，不算真实销量。这两种都是"预期内、正常发生"的过滤，
+    不是数据本身有问题，所以不逐行进清单，只在最后给一条汇总计数。
+    """
     path = Path(path)
     with open(path, "r", encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
@@ -152,9 +166,13 @@ def read_castlegate_csv(path: str | Path, platform: str) -> ReadResult:
 
         records: list[SourceRecord] = []
         skipped: list[str] = []
+        date_mismatch_count = 0
+        excluded_status_count = 0
         for row_num, row in enumerate(reader, start=2):
             sku = row.get("Item Number")
             qty = row.get("Quantity")
+            po_date_raw = row.get("PO Date")
+            status = row.get("Order Status")
             if (sku is None or sku.strip() == "") and (qty is None or qty.strip() == ""):
                 continue  # 空行跳过
 
@@ -164,6 +182,22 @@ def read_castlegate_csv(path: str | Path, platform: str) -> ReadResult:
                 continue
             if not qty or qty.strip() == "":
                 skipped.append(f"{origin}：「Quantity」是空的，跳过")
+                continue
+
+            if not po_date_raw or po_date_raw.strip() == "":
+                skipped.append(f"{origin}：「PO Date」是空的，跳过")
+                continue
+            try:
+                po_date = dt.datetime.strptime(po_date_raw.strip(), _PO_DATE_FORMAT).date()
+            except ValueError:
+                skipped.append(f"{origin}：「PO Date」的值 {po_date_raw!r} 认不出日期格式，跳过")
+                continue
+            if po_date != order_date:
+                date_mismatch_count += 1
+                continue
+
+            if (status or "").strip() in _EXCLUDED_ORDER_STATUSES:
+                excluded_status_count += 1
                 continue
 
             try:
@@ -180,6 +214,17 @@ def read_castlegate_csv(path: str | Path, platform: str) -> ReadResult:
                     quantity=qty_int,
                     origin=origin,
                 )
+            )
+
+        if date_mismatch_count:
+            skipped.append(
+                f"{path.name}：{date_mismatch_count} 行「PO Date」不是 {order_date}，"
+                "已跳过（这份导出本身包含多天的订单，正常情况）"
+            )
+        if excluded_status_count:
+            skipped.append(
+                f"{path.name}：{excluded_status_count} 行「Order Status」是 Rejected/Cancelled，"
+                "已排除（不算真实销量，正常情况）"
             )
     return ReadResult(records=records, skipped=skipped)
 
