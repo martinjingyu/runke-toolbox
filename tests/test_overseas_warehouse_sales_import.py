@@ -19,7 +19,11 @@ from modules.overseas_warehouse.sales_import.source_import import (
     read_castlegate_csv,
     read_erp_export,
 )
-from modules.overseas_warehouse.sales_import.xlsx_writer import _patch_sheet_xml, apply_cell_updates
+from modules.overseas_warehouse.sales_import.xlsx_writer import (
+    _force_full_calc_on_load,
+    _patch_sheet_xml,
+    apply_cell_updates,
+)
 
 REAL_DATA_DIR = Path(r"\\Rk\公共文件\个人\黄靖禺\海外仓-刘彩云")
 
@@ -455,9 +459,79 @@ def test_apply_cell_updates_only_touches_targeted_sheet_and_cells(tmp_path):
     zin = zipfile.ZipFile(src)
     zout = zipfile.ZipFile(dest)
     assert set(zin.namelist()) == set(zout.namelist())
-    unchanged = [n for n in zin.namelist() if "sheet1" not in n.lower()]
+    # 除了改动的那个 sheet，workbook.xml 也会被顺手改一下（打开 fullCalcOnLoad，见下面
+    # 专门的测试），其它部件（图片、样式、别的 sheet……）必须一个字节都不能动。
+    unchanged = [n for n in zin.namelist() if "sheet1" not in n.lower() and n != "xl/workbook.xml"]
     for name in unchanged:
         assert zin.read(name) == zout.read(name), f"{name} 不应该被改动"
+
+
+def test_force_full_calc_on_load_adds_attribute_to_existing_calc_pr():
+    xml = b'<?xml version="1.0"?><workbook><calcPr calcId="191029"/></workbook>'
+
+    patched = _force_full_calc_on_load(xml).decode("utf-8")
+
+    assert 'fullCalcOnLoad="1"' in patched
+    assert 'calcId="191029"' in patched  # 原有属性不能丢
+
+
+def test_force_full_calc_on_load_overwrites_existing_false_value():
+    xml = b'<?xml version="1.0"?><workbook><calcPr calcId="1" fullCalcOnLoad="0"/></workbook>'
+
+    patched = _force_full_calc_on_load(xml).decode("utf-8")
+
+    assert patched.count("fullCalcOnLoad") == 1
+    assert 'fullCalcOnLoad="1"' in patched
+
+
+def test_force_full_calc_on_load_inserts_tag_when_missing():
+    xml = b'<?xml version="1.0"?><workbook><sheets/></workbook>'
+
+    patched = _force_full_calc_on_load(xml).decode("utf-8")
+
+    assert '<calcPr fullCalcOnLoad="1"/>' in patched
+
+
+def test_apply_cell_updates_forces_full_recalc_so_dependent_formulas_are_not_stale(tmp_path):
+    # 真实踩到的坑：汇总表里"该行 Single SKU 销售总量"/"该平台 All SKU 销售总量"这些格子
+    # 都是公式，只改它们依赖的某一天那个格子，公式本身缓存的旧结果不会跟着变——Excel/WPS
+    # 打开时是不是重算，取决于 workbook.xml 的 <calcPr fullCalcOnLoad>有没有开。这里验证
+    # apply_cell_updates 每次真的改了格子，都会顺手把这个开关打开。
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws["A1"] = 1
+    ws["B1"] = "=SUM(A1:A1)"
+    src = tmp_path / "src.xlsx"
+    wb.save(src)
+
+    import zipfile
+
+    dest = tmp_path / "dest.xlsx"
+    apply_cell_updates(str(src), str(dest), {"Sheet1": {(1, 1): 999}})
+
+    with zipfile.ZipFile(dest) as z:
+        after_calc_pr = z.read("xl/workbook.xml").decode("utf-8")
+    assert 'fullCalcOnLoad="1"' in after_calc_pr
+
+
+def test_apply_cell_updates_does_not_touch_workbook_xml_when_nothing_is_updated(tmp_path):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    src = tmp_path / "src.xlsx"
+    wb.save(src)
+
+    dest = tmp_path / "dest.xlsx"
+    apply_cell_updates(str(src), str(dest), {"Sheet1": {}})
+
+    import zipfile
+
+    with zipfile.ZipFile(src) as z:
+        before = z.read("xl/workbook.xml")
+    with zipfile.ZipFile(dest) as z:
+        after = z.read("xl/workbook.xml")
+    assert before == after
 
 
 # ---------------------------------------------------------------------------
@@ -691,3 +765,10 @@ def test_real_sales_import_end_to_end(tmp_path):
     wb_after = openpyxl.load_workbook(target, read_only=True, data_only=True)
     for d in plan.diff_rows:
         assert wb_after[d.sheet_name].cell(row=d.row, column=d.col).value == d.new_value
+
+    # 写完之后必须强制下次打开重算，不然"该行/该平台汇总"这些公式格子会显示旧的缓存值——
+    # 这个坑是拿真实文件对比改之前改之后才发现的（缓存值改之前是13，改之后源数据明明
+    # 多了1件，缓存值却还是13没变），不是理论推测。
+    with zipfile.ZipFile(target) as zin:
+        workbook_xml = zin.read("xl/workbook.xml").decode("utf-8")
+    assert 'fullCalcOnLoad="1"' in workbook_xml

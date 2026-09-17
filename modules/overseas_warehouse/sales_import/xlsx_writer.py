@@ -10,6 +10,17 @@
 
 这里只处理"写一个纯数字值"这一种场景（销量格子），不处理公式格子、不处理字符串格子
 （不需要碰 sharedStrings.xml）。
+
+**改完之后必须强制整个工作簿在下次打开时重新算一遍公式**——这个坑是拿真实文件验证出来
+才发现的：汇总表里"该行 Single SKU 销售总量"（比如 M4=SUM(N4:AR4)，把这一行31天的
+销量加总）、"该平台 All SKU 销售总量"（第2行，比如=SUM(M4:M14)，把这个平台所有 SKU
+的行汇总再加总）这些格子都是公式，我们这里只改了公式依赖的"某一天"那个格子的值，
+公式本身没碰、但它缓存在 XML 里的 `<v>` 结果没有跟着重新算——Excel/WPS 是不是会自动
+重算，取决于这份工作簿 `xl/workbook.xml` 的 `<calcPr>` 设置里有没有开
+`fullCalcOnLoad`，实测这份表原本没开，导致这些汇总格子在业务人员打开表之后还是显示
+改之前的旧值。修法不是自己去重新算这些公式（公式种类多、还有跨 sheet 的
+VLOOKUP，自己算太容易算错），而是把 `fullCalcOnLoad` 打开，让打开这份表的 Excel/WPS
+自己去重算全表——这是 OOXML 标准里就有的机制，不是我们发明的。
 """
 from __future__ import annotations
 
@@ -120,6 +131,29 @@ def _row_num_of(row_xml: str) -> str:
     return m.group(1)
 
 
+_CALC_PR_RE = re.compile(r"<calcPr([^>]*)/>")
+_FULL_CALC_ATTR_RE = re.compile(r'\s*fullCalcOnLoad="[^"]*"')
+
+
+def _force_full_calc_on_load(workbook_xml_bytes: bytes) -> bytes:
+    """给 xl/workbook.xml 的 <calcPr> 标签打开 fullCalcOnLoad="1"——告诉打开这份表的
+    Excel/WPS："这份文件里有公式的缓存值可能不准了，打开的时候整表重新算一遍"。
+    没有 calcPr 标签（少见，但 OOXML 规范里这个标签本来就是可选的）就自己加一个。
+    """
+    text = workbook_xml_bytes.decode("utf-8")
+    m = _CALC_PR_RE.search(text)
+    if m:
+        attrs = _FULL_CALC_ATTR_RE.sub("", m.group(1))
+        new_tag = f'<calcPr{attrs} fullCalcOnLoad="1"/>'
+        text = text[: m.start()] + new_tag + text[m.end():]
+    else:
+        insert_at = text.rfind("</workbook>")
+        if insert_at == -1:
+            raise XlsxPatchError("workbook.xml 里找不到 </workbook>，格式不对")
+        text = text[:insert_at] + '<calcPr fullCalcOnLoad="1"/>' + text[insert_at:]
+    return text.encode("utf-8")
+
+
 def _patch_sheet_xml(sheet_xml_bytes: bytes, updates: dict[int, dict[int, float]]) -> bytes:
     text = sheet_xml_bytes.decode("utf-8")
     for row_num, col_updates in updates.items():
@@ -139,7 +173,7 @@ def apply_cell_updates(src_path: str, dest_path: str, updates: dict[str, dict[tu
     updates: {sheet_name: {(row, col): new_value}}
     """
     with zipfile.ZipFile(src_path, "r") as zin:
-        patched_sheet_xml: dict[str, bytes] = {}
+        patched: dict[str, bytes] = {}
         for sheet_name, cell_updates in updates.items():
             if not cell_updates:
                 continue
@@ -147,12 +181,17 @@ def apply_cell_updates(src_path: str, dest_path: str, updates: dict[str, dict[tu
             by_row: dict[int, dict[int, float]] = {}
             for (row, col), value in cell_updates.items():
                 by_row.setdefault(row, {})[col] = value
-            sheet_bytes = patched_sheet_xml.get(target_path) or zin.read(target_path)
-            patched_sheet_xml[target_path] = _patch_sheet_xml(sheet_bytes, by_row)
+            sheet_bytes = patched.get(target_path) or zin.read(target_path)
+            patched[target_path] = _patch_sheet_xml(sheet_bytes, by_row)
+
+        if patched:
+            # 只要真的改了任何格子，就强制下次打开整表重算——不然改了销量格子，
+            # 依赖它的"该行汇总"/"该平台汇总"这些公式格子会显示旧的缓存值。
+            patched["xl/workbook.xml"] = _force_full_calc_on_load(zin.read("xl/workbook.xml"))
 
         with zipfile.ZipFile(dest_path, "w", zipfile.ZIP_DEFLATED) as zout:
             for item in zin.infolist():
-                data = patched_sheet_xml.get(item.filename, None)
+                data = patched.get(item.filename, None)
                 if data is None:
                     data = zin.read(item.filename)
                 zout.writestr(item, data)
