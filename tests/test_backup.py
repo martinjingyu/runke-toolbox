@@ -3,7 +3,7 @@ from pathlib import Path
 import openpyxl
 import pytest
 
-from core.backup import atomic_save_with_backup
+from core.backup import atomic_replace_with_backup, atomic_save_with_backup
 
 
 def _make_wb(value: str):
@@ -49,3 +49,31 @@ def test_atomic_save_with_backup_works_when_target_does_not_exist_yet(tmp_path):
 
     assert openpyxl.load_workbook(path).active["A1"].value == "first"
     assert not backup_path.exists()  # 原本就没有旧文件，自然也没有备份可言
+
+
+def test_atomic_replace_with_backup_swaps_in_new_content_and_keeps_old_as_backup(tmp_path):
+    path = tmp_path / "target.txt"
+    path.write_text("old", encoding="utf-8")
+
+    def _write(tmp_path_arg):
+        Path(tmp_path_arg).write_text("new", encoding="utf-8")
+
+    backup_path = atomic_replace_with_backup(path, _write)
+
+    assert path.read_text(encoding="utf-8") == "new"
+    assert backup_path.read_text(encoding="utf-8") == "old"
+    assert list(tmp_path.glob("*.写入中-*")) == []
+
+
+def test_atomic_replace_with_backup_leaves_original_untouched_when_write_fails(tmp_path):
+    path = tmp_path / "target.txt"
+    path.write_text("old", encoding="utf-8")
+
+    def _write(_tmp_path_arg):
+        raise RuntimeError("模拟写入失败")
+
+    with pytest.raises(RuntimeError):
+        atomic_replace_with_backup(path, _write)
+
+    assert path.read_text(encoding="utf-8") == "old"
+    assert list(tmp_path.glob("*.备份-*")) == []

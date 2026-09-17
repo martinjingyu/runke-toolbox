@@ -20,6 +20,31 @@ def backup_file(path: str | Path) -> Path:
     return backup_path
 
 
+def atomic_replace_with_backup(path: str | Path, write_new_content) -> Path:
+    """跟 atomic_save_with_backup 是同一套"先在别处把新内容完整写出来，成功了才原子改名
+    切换"的安全模式，只是不假设新内容是通过 openpyxl 的 wb.save() 产生的——有些场景不能用
+    openpyxl 存盘（比如 modules/overseas_warehouse/sales_import 那个场景：目标文件里用了
+    openpyxl 完全不认识的 WPS 专有部件，openpyxl 存盘会把这些部件丢光，只能自己手动拼 zip），
+    调用方传一个 write_new_content(tmp_path) 的回调，自己决定怎么把新内容写到 tmp_path，
+    这里只负责"写失败就不碰原文件、写成功了才原子换上去、原文件挪去当备份"这部分。
+    """
+    path = Path(path)
+    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_path = path.with_name(f"{path.stem}.备份-{timestamp}{path.suffix}")
+    tmp_path = path.with_name(f"{path.stem}.写入中-{timestamp}{path.suffix}")
+
+    write_new_content(tmp_path)  # 失败的话异常直接往外抛，原文件这时候还完全没被碰过
+
+    try:
+        if path.exists():
+            path.replace(backup_path)
+        tmp_path.replace(path)
+    except OSError as exc:
+        raise OSError(f"改名切换失败，新内容还完整保留在「{tmp_path}」，需要手动处理") from exc
+
+    return backup_path
+
+
 def atomic_save_with_backup(wb, path: str | Path) -> Path:
     """把 wb 存到 path，但不直接在原文件上覆盖写——先把新内容存到同目录下一个临时文件，
     存成功了才把原文件改名成备份、把临时文件改名成 path 这个名字（改名都是同一块磁盘上的
