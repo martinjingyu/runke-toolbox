@@ -65,16 +65,31 @@ def _file_picker_row(label_text: str, on_browse) -> tuple[QHBoxLayout, QLineEdit
 class _CsvFileEntry:
     def __init__(self, path: str):
         self.path = path
-        self.platform_combo = QComboBox()
-        for key in IMPORTABLE_PLATFORMS:
-            self.platform_combo.addItem(_PLATFORM_LABELS[key])
+        self.platform_combo: QComboBox | None = None
+        default_text = None
         guessed = guess_platform_from_filename(Path(path).name)
         if guessed:
-            self.platform_combo.setCurrentText(_PLATFORM_LABELS[guessed])
+            default_text = _PLATFORM_LABELS[guessed]
+        self.rebuild_combo(default_text)
 
     @property
     def platform(self) -> str:
         return _LABEL_TO_PLATFORM[self.platform_combo.currentText()]
+
+    def rebuild_combo(self, selected_text: str | None) -> None:
+        """再次点「添加 CSV 文件…」时，_rebuild_csv_table 会先 setRowCount(0) 清空整张表——
+        之前用 setCellWidget 挂上去的 QComboBox 归表格所有，这一清空就被 Qt 销毁了，
+        这个 entry 手里存的 self.platform_combo 就变成了指向已经被删掉的 C++ 对象的
+        Python 引用，再往表格里塞同一个对象会直接崩掉（不是抛异常能接住的那种，是
+        C++ 层面的 use-after-free，表现出来就是整个程序闪退）。所以每次重建表格，
+        不管是不是新加的文件，所有 entry 的下拉框都要重新建一份，不能指望旧的还能用——
+        跟 shipment_plan_apply/panel.py 的 _PlanFileEntry.rebuild_combos 是同一个坑。
+        """
+        self.platform_combo = QComboBox()
+        for key in IMPORTABLE_PLATFORMS:
+            self.platform_combo.addItem(_PLATFORM_LABELS[key])
+        if selected_text:
+            self.platform_combo.setCurrentText(selected_text)
 
 
 def _build_diff_table(plan: ImportPlan) -> DiffTable:
@@ -275,8 +290,15 @@ class SalesImportPanel(QWidget):
 
     def _rebuild_csv_table(self) -> None:
         table = self._csv_table
+        # setRowCount(0) 会把之前 setCellWidget 挂上去的下拉框一起销毁掉（表格拥有这些
+        # 控件），所以清空之前先把每个 entry 当前选的平台记下来，清空之后给每个 entry
+        # （不只是新加的）都重新建一份下拉框、把选择复原——见 _CsvFileEntry.rebuild_combo
+        # 的说明，这是"一个一个添加 CSV 文件会直接闪退"这个问题的根因。
+        selected_by_entry = {id(e): e.platform_combo.currentText() for e in self._csv_entries}
         table.setRowCount(0)
         for entry in self._csv_entries:
+            entry.rebuild_combo(selected_by_entry[id(entry)])
+
             row = table.rowCount()
             table.insertRow(row)
             table.setItem(row, 0, QTableWidgetItem(Path(entry.path).name))
