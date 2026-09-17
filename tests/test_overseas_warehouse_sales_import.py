@@ -625,6 +625,61 @@ def test_build_plan_matches_records_to_correct_cells_and_reports_unmatched(tmp_p
     assert "找不到这个 SKU" in plan.unmatched[0].reason
 
 
+def test_build_plan_clears_untouched_rows_in_a_touched_platform_by_default(tmp_path):
+    # 业务要求：这次源数据里出现过的"仓库+平台"，这一天这一列要整列处理——这次没数据的
+    # SKU 得清成0，不能留着旧值，防止"这个SKU这次其实没有销量了，但格子还显示着上次
+    # 导入时留下的数字"这种情况。
+    target = _build_target_workbook(tmp_path)
+    wb = openpyxl.load_workbook(target)
+    wb["TX1"].cell(row=5, column=5, value=99)  # TD-2（这次源数据里不会出现）的 2号 提前塞个旧值
+    wb.save(target)
+
+    records = [
+        SourceRecord(warehouse="TX1", platform="WF-RX", sku="TD-1", quantity=8, origin="test"),
+    ]
+    plan = build_plan(target, day=2, records=records)
+
+    by_sku = {d.sku: d for d in plan.diff_rows}
+    assert set(by_sku) == {"TD-1", "TD-2"}
+    assert (by_sku["TD-1"].old_value, by_sku["TD-1"].new_value) == (0, 8)
+    assert (by_sku["TD-2"].old_value, by_sku["TD-2"].new_value) == (99, 0)  # 被清空
+
+
+def test_build_plan_clears_platforms_and_warehouses_with_no_source_data_at_all(tmp_path):
+    # 业务明确要求的效果（不是只清"这次真的有数据的平台"）：这次源数据只给了 TX1 的
+    # WF-RX，但 TX1 的 OS 平台、以及完全没提到的 IL 仓库，这一天原来有值的格子也要被
+    # 一起清空——四张表、四个平台，这一天全部整列过一遍，不是只处理这次涉及到的那几个。
+    target = _build_target_workbook(tmp_path)
+    wb = openpyxl.load_workbook(target)
+    wb["TX1"].cell(row=4, column=9, value=42)  # TD-1 的 OS 平台 2号（col8起始，col9=2号）
+    wb["IL"].cell(row=4, column=5, value=17)  # IL 仓库 TD-3 的 WF-RX 平台 2号
+    wb.save(target)
+
+    records = [
+        SourceRecord(warehouse="TX1", platform="WF-RX", sku="TD-1", quantity=8, origin="test"),
+    ]
+    plan = build_plan(target, day=2, records=records)
+
+    by_key = {(d.warehouse, d.platform, d.sku): d for d in plan.diff_rows}
+    assert (by_key[("TX1", "OS", "TD-1")].old_value, by_key[("TX1", "OS", "TD-1")].new_value) == (42, 0)
+    assert (by_key[("IL", "WF-RX", "TD-3")].old_value, by_key[("IL", "WF-RX", "TD-3")].new_value) == (17, 0)
+
+
+def test_build_plan_clear_untouched_rows_can_be_disabled(tmp_path):
+    target = _build_target_workbook(tmp_path)
+    wb = openpyxl.load_workbook(target)
+    wb["TX1"].cell(row=5, column=5, value=99)
+    wb.save(target)
+
+    records = [
+        SourceRecord(warehouse="TX1", platform="WF-RX", sku="TD-1", quantity=8, origin="test"),
+    ]
+    plan = build_plan(target, day=2, records=records, clear_untouched_rows=False)
+
+    assert len(plan.diff_rows) == 1
+    assert plan.diff_rows[0].sku == "TD-1"
+
+
 def test_build_plan_falls_back_to_stripping_last_dash_suffix(tmp_path):
     # 业务确认过的规则：源数据里的 SKU 如果原文对不上，去掉最后一个"-"后面的部分再试
     # 一次（比如"TD-5-RX"对应汇总表里的"TD-5"），匹配上了不算"未匹配"，要单独提示是

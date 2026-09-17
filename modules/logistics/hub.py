@@ -47,6 +47,12 @@ def _build_shipment_summary_apply_panel() -> QWidget:
     return ShipmentSummaryApplyPanel()
 
 
+def _build_fba_shipment_id_fill_panel() -> QWidget:
+    from .fba_shipment_id_fill.panel import FbaShipmentIdFillPanel
+
+    return FbaShipmentIdFillPanel()
+
+
 def _build_logistics_tracking_panel() -> QWidget:
     from .logistics_tracking.panel import LogisticsTrackingPanel
 
@@ -128,6 +134,15 @@ def build_panel() -> QWidget:
             name="发货计划汇总表更新",
             description="把运营提交的发货计划表导入，只更新发货计划汇总表（不碰采购订单汇总表）",
             build_panel=_build_shipment_summary_apply_panel,
+            dependencies=[
+                pip_package("openpyxl", display_name="openpyxl（读写 Excel）"),
+            ],
+        ),
+        ToolInfo(
+            id="fba_shipment_id_fill",
+            name="FBA 货件编号回填",
+            description="把爬取到的 FBA 货件编号按标签（MSKU）匹配进发货计划表，按箱数拆分对应的行，拆分结果留在原来的位置",
+            build_panel=_build_fba_shipment_id_fill_panel,
             dependencies=[
                 pip_package("openpyxl", display_name="openpyxl（读写 Excel）"),
             ],

@@ -119,7 +119,22 @@ def _strip_last_dash_suffix(sku: str) -> str | None:
     return prefix
 
 
-def build_plan(target_path: str | Path, day: int, records: list[SourceRecord]) -> ImportPlan:
+def build_plan(
+    target_path: str | Path,
+    day: int,
+    records: list[SourceRecord],
+    clear_untouched_rows: bool = True,
+) -> ImportPlan:
+    """clear_untouched_rows=True（默认，业务明确要求的行为）：不管这次源数据实际覆盖了
+    哪些"仓库+平台"，这一天在全部 4 个仓库 sheet × 全部 4 个平台（OS/WF-RX/WF-RQ/WF-TS）
+    这一列，都会整列处理——这次有数据的 SKU 写新数据，没数据的 SKU（不管这个"仓库+平台"
+    这次是不是提供了源文件）一律清成 0。
+
+    这意味着**每次导入都必须把当天全部源文件（ERP + CG 的 3 份 CSV）一起选上**，漏选
+    哪一份，那一份对应平台当天的真实销量会被一起清空，不会因为"这次没提供这个平台的
+    文件"就保留它原来的值——这是业务确认过的、故意要的效果（宁可漏选时错误清空、也要
+    保证不会有导入不掉的旧数据残留），不是遗漏考虑。
+    """
     if not 1 <= day <= 31:
         raise PlanError(f"「几号」必须是 1-31 之间的数字，收到的是 {day!r}")
 
@@ -212,6 +227,26 @@ def build_plan(target_path: str | Path, day: int, records: list[SourceRecord]) -
         if key not in resolved:
             resolved[key] = {"col": col, "matched_sku": matched_sku, "qty": 0}
         resolved[key]["qty"] += qty
+
+    if clear_untouched_rows:
+        # 不管这次源数据有没有覆盖到，目标表里现有的每个仓库 × 全部 4 个平台，这一天
+        # 这一列都整列过一遍——业务明确要的效果，见函数开头的说明。
+        for warehouse in sheet_names:
+            header_map = _get_header_map(warehouse)
+            ws = wb[sheet_names[warehouse]]
+            for platform in IMPORTABLE_PLATFORMS:
+                block = header_map.platforms.get(platform)
+                if block is None or day not in block.day_columns:
+                    continue  # 这个仓库的表里本来就没有这个平台的区块，没有列可清
+                col = block.day_columns[day]
+                for sku, row in header_map.sku_rows.items():
+                    key = (warehouse, platform, row)
+                    if key in resolved:
+                        continue  # 这一行这次有真实数据，上面已经处理过
+                    old_value = ws.cell(row=row, column=col).value or 0
+                    if not old_value:
+                        continue  # 本来就是空/0，没什么好清的
+                    resolved[key] = {"col": col, "matched_sku": sku, "qty": 0}
 
     diff_rows: list[DiffRow] = []
     for (warehouse, platform, row), acc in sorted(resolved.items()):
