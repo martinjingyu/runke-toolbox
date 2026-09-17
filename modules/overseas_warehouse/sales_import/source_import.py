@@ -60,12 +60,19 @@ class ReadResult:
 
 def read_erp_export(path: str | Path) -> ReadResult:
     path = Path(path)
-    # 必须全程都在 `with open(...)` 里面读完，不能提前把文件对象关掉——read_only=True
-    # 是边读边从 zip 流里拉数据的，不是打开的时候就整个吃进内存，`fh` 一关后面
-    # `iter_rows()` 再往下取行就会报 "seek of closed file"。
+    # 必须全程都在 `with open(...)` 里面读完，不能提前把文件对象关掉——非 read_only 模式
+    # 虽然是一次性整个解析进内存的，但保持跟旧代码一样的写法更保险，不用再纠结这件事。
+    #
+    # 这里故意不用 read_only=True：拿真实的 0915 那份 ERP 导出验证过，read_only 模式下
+    # ws.max_row/max_column 是直接读 sheet XML 里 <dimension> 标签的声明值，不会真的去扫
+    # <sheetData>——而这份文件的 <dimension> 标签写的是 "A1"（骗人的，可能是 ERP 导出
+    # 工具自己的 bug），哪怕 <sheetData> 里其实有 71 行 48 列的真实数据，read_only 模式
+    # 下 ws.max_row 还是会算成 1，导致后面读表头直接读到一个空表头、误判成"表头缺列"。
+    # 非 read_only 模式会完整解析 <sheetData>、自己数出真实的行列数，不受这个假 dimension
+    # 标签影响。ERP 导出文件体量很小（几十到几百行），完整解析也很快，不用担心性能。
     try:
         with open(path, "rb") as fh:
-            wb = openpyxl.load_workbook(fh, read_only=True, data_only=True)
+            wb = openpyxl.load_workbook(fh, read_only=False, data_only=True)
             return _read_erp_rows(wb, path)
     except BadZipFile as exc:
         raise SourceReadError(

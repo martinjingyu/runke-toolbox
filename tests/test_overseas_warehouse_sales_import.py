@@ -236,6 +236,44 @@ def test_read_erp_export_works_even_though_extension_is_xls(tmp_path):
     assert result.skipped == []
 
 
+def test_read_erp_export_ignores_a_lying_dimension_tag(tmp_path):
+    # 真实踩到的坑：2026-09-15 那份 ERP 导出，sheet XML 里 <dimension ref="A1"/> 是假的
+    # （骗人只有一格），但 <sheetData> 里其实有 71 行真实数据。openpyxl 的 read_only 模式
+    # 直接信这个 <dimension> 标签算 ws.max_row，不会真的去扫 <sheetData>，所以之前用
+    # read_only=True 读出来的 ws.max_row 是 1，把一份有 70 笔订单的文件误判成"表头缺列"
+    # 直接报错。这里手工把一份正常存出来的文件的 <dimension> 标签改成假的"A1"，模拟这个
+    # 真实场景，确保改成 read_only=False 之后不会再被这个假标签骗到。
+    import re
+    import zipfile
+
+    path = _build_erp_export(
+        tmp_path,
+        [
+            ["CS1", "Overstock", "至美通CA1", "TD-1", 1],
+            ["CS2", "Wayfair US", "至美通IL1", "TD-2", 2],
+        ],
+    )
+
+    with zipfile.ZipFile(path) as zin:
+        sheet_xml = zin.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        other_files = {n: zin.read(n) for n in zin.namelist() if n != "xl/worksheets/sheet1.xml"}
+
+    lying_xml = re.sub(r'<dimension ref="[^"]*"/>', '<dimension ref="A1"/>', sheet_xml)
+    assert lying_xml != sheet_xml  # 确认真的替换生效了，不是正则没匹配上
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name, data in other_files.items():
+            zout.writestr(name, data)
+        zout.writestr("xl/worksheets/sheet1.xml", lying_xml)
+
+    result = read_erp_export(path)
+
+    assert result.records == [
+        SourceRecord(warehouse="CA1", platform="OS", sku="TD-1", quantity=1, origin="ERP 第2行"),
+        SourceRecord(warehouse="IL", platform="WF-RX", sku="TD-2", quantity=2, origin="ERP 第3行"),
+    ]
+
+
 def test_read_erp_export_forces_cg_rows_to_os_regardless_of_shop_field(tmp_path):
     # 业务确认过的规则：CG 自己的分平台数据是靠 CastleGate 那 3 份 CSV 导入的，ERP 里
     # 判定成 CG 仓库的行，不管「店铺」字段实际写的是什么（Wayfair RQ/Wayfair3/...），
