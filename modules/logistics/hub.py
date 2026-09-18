@@ -29,12 +29,6 @@ def _build_fba_label_redact_panel() -> QWidget:
     return FbaLabelRedactPanel()
 
 
-def _build_shipment_plan_apply_panel() -> QWidget:
-    from .shipment_plan_apply.panel import ShipmentPlanApplyPanel
-
-    return ShipmentPlanApplyPanel()
-
-
 def _build_purchase_allocation_apply_panel() -> QWidget:
     from .shipment_plan_apply.purchase_only_panel import PurchaseAllocationApplyPanel
 
@@ -88,41 +82,17 @@ def _build_lowm_label_split_panel() -> QWidget:
 def build_panel() -> QWidget:
     tools = [
         ToolInfo(
-            id="walmart_shipment_reconcile",
-            name="发货数量核对（Walmart）",
-            description="核对箱唛实际发货数量和发货计划表是否一致，并按 SKU 拆分箱唛 PDF",
-            build_panel=_build_walmart_reconcile_panel,
-            dependencies=[
-                pip_package("openpyxl", display_name="openpyxl（读写 Excel）"),
-                pip_package("pymupdf", import_name="fitz", display_name="PyMuPDF（读取 PDF）"),
-                pip_package("Pillow", import_name="PIL", display_name="Pillow（图片处理）"),
-                vc_redist(),
-                pylibdmtx_decoder(),
-                pip_package("pytesseract", display_name="pytesseract（OCR 接口）"),
-                tesseract_ocr(),
-            ],
-        ),
-        ToolInfo(
-            id="fba_label_redact",
-            name="FBA 标签发货人信息脱敏",
-            description="批量去掉一个目录下箱唛 PDF 的发货人信息，加拿大目的地额外整个删掉发货地",
-            build_panel=_build_fba_label_redact_panel,
-            dependencies=[
-                pip_package("pymupdf", import_name="fitz", display_name="PyMuPDF（读取/编辑 PDF）"),
-            ],
-        ),
-        ToolInfo(
-            id="shipment_plan_apply",
-            name="发货计划自动更新",
-            description="把运营提交的发货计划表导入，自动更新采购订单汇总表和发货计划汇总表",
-            build_panel=_build_shipment_plan_apply_panel,
+            id="purchase_order_import",
+            name="采购订单同步采购订单汇总表和发货计划表",
+            description="批量读取一个文件夹里的采购订单文件，自动追加进采购订单汇总表和发货计划汇总表",
+            build_panel=_build_purchase_order_import_panel,
             dependencies=[
                 pip_package("openpyxl", display_name="openpyxl（读写 Excel）"),
             ],
         ),
         ToolInfo(
             id="purchase_allocation_apply",
-            name="采购订单分摊更新",
+            name="运营计划同步更新采购订单汇总表",
             description="把运营提交的发货计划表导入，只更新采购订单汇总表（不碰发货计划汇总表）",
             build_panel=_build_purchase_allocation_apply_panel,
             dependencies=[
@@ -131,7 +101,7 @@ def build_panel() -> QWidget:
         ),
         ToolInfo(
             id="shipment_summary_apply",
-            name="发货计划汇总表更新",
+            name="运营计划同步更新发货计划表",
             description="把运营提交的发货计划表导入，只更新发货计划汇总表（不碰采购订单汇总表）",
             build_panel=_build_shipment_summary_apply_panel,
             dependencies=[
@@ -148,29 +118,43 @@ def build_panel() -> QWidget:
             ],
         ),
         ToolInfo(
-            id="logistics_tracking",
-            name="物流跟踪自动更新",
-            description="按物流商分组，并行去各货代平台查询运单最后路由，自动更新物流跟踪表格",
-            build_panel=_build_logistics_tracking_panel,
+            id="fba_label_redact",
+            name="批量删除FBA公司名称",
+            description="批量去掉一个目录下箱唛 PDF 的发货人信息，加拿大目的地额外整个删掉发货地",
+            build_panel=_build_fba_label_redact_panel,
             dependencies=[
-                pip_package("openpyxl", display_name="openpyxl（读写 Excel）"),
-                pip_package("requests", display_name="requests（调用货代平台接口）"),
-                pip_package("pycryptodome", import_name="Crypto", display_name="pycryptodome（壹鹿有你/众壹登录用的 AES/RSA 加密）"),
+                pip_package("pymupdf", import_name="fitz", display_name="PyMuPDF（读取/编辑 PDF）"),
             ],
         ),
         ToolInfo(
-            id="purchase_order_import",
-            name="采购订单批量导入",
-            description="批量读取一个文件夹里的采购订单文件，自动追加进采购订单汇总表和发货计划汇总表",
-            build_panel=_build_purchase_order_import_panel,
+            id="walmart_shipment_reconcile",
+            name="CK-WM 外箱标拆分",
+            description="核对箱唛实际发货数量和发货计划表是否一致，并按 SKU 拆分箱唛 PDF；文件命名格式：SKU-数量-仓库-厂商",
+            build_panel=_build_walmart_reconcile_panel,
             dependencies=[
                 pip_package("openpyxl", display_name="openpyxl（读写 Excel）"),
+                pip_package("pymupdf", import_name="fitz", display_name="PyMuPDF（读取 PDF）"),
+                pip_package("Pillow", import_name="PIL", display_name="Pillow（图片处理）"),
+                vc_redist(),
+                pylibdmtx_decoder(),
+                pip_package("pytesseract", display_name="pytesseract（OCR 接口）"),
+                tesseract_ocr(),
+            ],
+        ),
+        ToolInfo(
+            id="lowm_label_split",
+            name="LO-WM 外箱标拆分",
+            description="不认 SKU，按发货计划表里未发货的箱数汇总，直接按页把 Walmart 站点箱唛 PDF 分给各厂商；文件命名格式：SKU-数量-仓库-厂商",
+            build_panel=_build_lowm_label_split_panel,
+            dependencies=[
+                pip_package("pymupdf", import_name="fitz", display_name="PyMuPDF（读取/拆分 PDF）"),
+                pip_package("openpyxl", display_name="openpyxl（读发货计划表）"),
             ],
         ),
         ToolInfo(
             id="ca1_label_split",
-            name="CA1 入库标签 PDF 拆分",
-            description="按发货计划表里仓库含 CA1、未发货的标签，把一份入库标签 PDF 拆成一个标签一个文件",
+            name="CA1 外箱标拆分",
+            description="按发货计划表里仓库含 CA1、未发货的标签，把一份入库标签 PDF 拆成一个标签一个文件；文件命名格式：SKU-数量-厂商",
             build_panel=_build_ca1_label_split_panel,
             dependencies=[
                 pip_package("pymupdf", import_name="fitz", display_name="PyMuPDF（读取/拆分 PDF）"),
@@ -179,8 +163,8 @@ def build_panel() -> QWidget:
         ),
         ToolInfo(
             id="cg_label_split",
-            name="CG 入库标签 PDF 拆分",
-            description="按发货计划表里仓库含 CG、未发货的标签，把一份入库标签 PDF 拆成一个标签一个文件",
+            name="CG外箱标拆分",
+            description="按发货计划表里仓库含 CG、未发货的标签，把一份入库标签 PDF 拆成一个标签一个文件；文件命名格式：SKU-数量-厂商",
             build_panel=_build_cg_label_split_panel,
             dependencies=[
                 pip_package("pymupdf", import_name="fitz", display_name="PyMuPDF（读取/拆分 PDF）"),
@@ -188,13 +172,14 @@ def build_panel() -> QWidget:
             ],
         ),
         ToolInfo(
-            id="lowm_label_split",
-            name="LO-WM 箱唛 PDF 拆分",
-            description="不认 SKU，按发货计划表里未发货的箱数汇总，直接按页把 Walmart 站点箱唛 PDF 分给各厂商",
-            build_panel=_build_lowm_label_split_panel,
+            id="logistics_tracking",
+            name="FBA-货代-出货跟踪总表更新",
+            description="按物流商分组，并行去各货代平台查询运单最后路由，自动更新物流跟踪表格",
+            build_panel=_build_logistics_tracking_panel,
             dependencies=[
-                pip_package("pymupdf", import_name="fitz", display_name="PyMuPDF（读取/拆分 PDF）"),
-                pip_package("openpyxl", display_name="openpyxl（读发货计划表）"),
+                pip_package("openpyxl", display_name="openpyxl（读写 Excel）"),
+                pip_package("requests", display_name="requests（调用货代平台接口）"),
+                pip_package("pycryptodome", import_name="Crypto", display_name="pycryptodome（壹鹿有你/众壹登录用的 AES/RSA 加密）"),
             ],
         ),
     ]
