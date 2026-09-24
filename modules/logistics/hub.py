@@ -124,6 +124,7 @@ def build_panel() -> QWidget:
             build_panel=_build_fba_label_redact_panel,
             dependencies=[
                 pip_package("pymupdf", import_name="fitz", display_name="PyMuPDF（读取/编辑 PDF）"),
+                pip_package("fonttools", import_name="fontTools", display_name="fontTools（裁剪嵌入字体，缩小输出 PDF）"),
             ],
         ),
         ToolInfo(
