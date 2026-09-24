@@ -55,7 +55,7 @@ from typing import Callable
 
 import fitz
 
-from .ca_split import VendorLookup, resolve_vendor_and_warehouse, split_ca_pdf
+from .ca_split import VendorLookup, resolve_vendor_and_warehouse, save_compact, split_ca_pdf
 
 FBA_DIR_NAME = "FBA"
 UNSORTED_DIR_NAME = "未分类"  # 暂时没用到——之前按厂商/仓库分文件夹时，解析不出来的文件才会用它
@@ -313,6 +313,12 @@ def run(
 
         is_ca = any(r.status == "加拿大" for r in doc_results)
 
+        # 先裁剪字体再拆分，拆出来的每个厂商文件带的就是裁剪后的小字体
+        try:
+            doc.subset_fonts()
+        except Exception:
+            pass
+
         if is_ca and vendor_lookup is not None:
             split_result = split_ca_pdf(doc, path.name, out_dir, vendor_lookup)
             if split_result.note is None:
@@ -337,7 +343,7 @@ def run(
         # out_dir.mkdir(parents=True, exist_ok=True)
 
         out_path = out_dir / path.name
-        doc.save(out_path)
+        save_compact(doc, out_path)
         doc.close()
         report.output_paths.append(out_path)
 

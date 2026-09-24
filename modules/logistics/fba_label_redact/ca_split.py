@@ -153,6 +153,17 @@ def resolve_vendor_and_warehouse(file_name: str) -> tuple[str, str] | None:
     return vendors[0], warehouse
 
 
+def save_compact(doc: fitz.Document, path: Path) -> None:
+    """保存 PDF：先把嵌入的字体裁剪成只剩用到的字形（重画文字时每页都嵌了一整套中文字体，
+    不裁剪的话文件会大几十倍），再做垃圾回收和压缩。subset_fonts 依赖 fontTools，
+    没装或者裁剪失败就跳过这一步，只做压缩，不影响出文件。"""
+    try:
+        doc.subset_fonts()
+    except Exception:
+        pass
+    doc.save(path, garbage=4, deflate=True, deflate_fonts=True)
+
+
 def extract_pages(src: fitz.Document, page_indices: list[int]) -> fitz.Document:
     new_doc = fitz.open()
     for idx in page_indices:
@@ -216,7 +227,7 @@ def split_ca_pdf(doc: fitz.Document, file_name: str, output_dir: Path, vendor_lo
         # 都存到同一个 output_dir，文件名带上厂商前缀区分，不然不同厂商拆出来的文件名会撞车
         # （拆分之前只有一份 rest，同一份原文件拆出的每个厂商版本 rest 都一样）
         out_path = output_dir / f"{vendor}-{rest}"
-        new_doc.save(out_path)
+        save_compact(new_doc, out_path)
         new_doc.close()
         output_paths.append(out_path)
 
